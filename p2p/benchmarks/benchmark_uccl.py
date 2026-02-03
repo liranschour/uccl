@@ -578,8 +578,10 @@ def main():
             _run_server_ipc(args, ep)
     else:
         if rank == 0:
+            print(f"XXX {ep})
             _run_client(args, ep, remote_metadata)
         else:
+            print(f"XXX {ep})
             _run_server(args, ep, remote_metadata)
 
     dist.destroy_process_group()
