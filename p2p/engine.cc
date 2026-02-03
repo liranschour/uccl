@@ -32,6 +32,37 @@ inline void check_python_signals() {
   PyGILState_Release(gstate);
 }
 
+bool is_local_ip(const std::string& ip) {
+    struct ifaddrs* ifaddr;
+    if (getifaddrs(&ifaddr) == -1)
+        return false;
+
+    bool found = false;
+    for (auto* ifa = ifaddr; ifa; ifa = ifa->ifa_next) {
+        if (!ifa->ifa_addr) continue;
+
+        char host[NI_MAXHOST];
+        int family = ifa->ifa_addr->sa_family;
+
+        if (family == AF_INET || family == AF_INET6) {
+            getnameinfo(
+                ifa->ifa_addr,
+                (family == AF_INET) ? sizeof(sockaddr_in) : sizeof(sockaddr_in6),
+                host, NI_MAXHOST,
+                nullptr, 0, NI_NUMERICHOST
+            );
+
+            if (ip == host) {
+                found = true;
+                break;
+            }
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return found;
+}
+
 Endpoint::Endpoint(uint32_t const local_gpu_idx, uint32_t const num_cpus)
     : local_gpu_idx_(local_gpu_idx), num_cpus_(num_cpus) {
   std::cout << "Creating Engine with GPU index: " << local_gpu_idx
@@ -190,6 +221,8 @@ bool Endpoint::connect(std::string ip_addr, int remote_gpu_idx, int remote_port,
                        uint64_t& conn_id) {
   std::cout << "Attempting to connect to " << ip_addr << ":" << remote_gpu_idx
             << " via port " << remote_port << std::endl;
+
+  std::cout << "Is local IP " << ip_addr << " IS: " << is_local_ip(ip_addr);
   // Create a new connection ID
   conn_id = next_conn_id_.fetch_add(1);
 
