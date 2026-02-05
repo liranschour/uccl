@@ -1,5 +1,3 @@
-
-
 #include "buffer.cuh"
 #include "ep_configs.cuh"
 #include "ep_launch.cuh"
@@ -1041,15 +1039,14 @@ __global__ void __launch_bounds__(
               num_bytes_per_msg,
               translate_dst_rdma_rank<kLowLatencyMode>(dst_rdma_rank, nvl_rank),
               channel_id,  // NOTE(MaoZiming): use channel_id for rb.
-              lane_id, 0, d2h_channel_addrs, num_d2h_channel_addrs, false,
+              lane_id, 0, d2h_channel_addrs, num_d2h_channel_addrs, false, -1,
           // NOTE(MaoZiming): for AMD GPUs, we directly send a subsequent RDMA
           // to update the tail. For other GPUs and EFA NICs, we use the
           // CPU-emulated atomics, allow us to piggyback the atomic operation
           // with the RDMA send.
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
-              -1,
+              0, 0
 #else
-              -1,
               reinterpret_cast<uint64_t>(rdma_channel_tail.buffer(rdma_rank)) -
                   reinterpret_cast<uint64_t>(original_atomic_buffer_ptr),
               num_tokens_to_issue
@@ -1674,8 +1671,9 @@ __global__ void cached_notify(
     // NOTE(zhuang12): for support channel numbers >= WARP_SIZE, we need to
     // iterate over the channels in a warp-wise manner
     int remain_warp_id = warp_id;
-    for (int i = 0; i < num_channels; i += num_warps) {
-      warp_id = i * num_warps + remain_warp_id;
+    for (int channel_start = 0; channel_start < num_channels;
+         channel_start += num_warps) {
+      warp_id = channel_start + remain_warp_id;
 #endif
       if (lane_id < num_rdma_ranks and warp_id < num_channels) {
         int token_start_idx, token_end_idx;
@@ -1714,8 +1712,9 @@ __global__ void cached_notify(
     // NOTE(zhuang12): for support channel numbers >= WARP_SIZE, we need to
     // iterate over the channels in a warp-wise manner
     int remain_warp_id = warp_id;
-    for (int i = 0; i < num_channels; i += num_warps) {
-      warp_id = i * num_warps + remain_warp_id;
+    for (int channel_start = 0; channel_start < num_channels;
+         channel_start += num_warps) {
+      warp_id = channel_start + remain_warp_id;
 #endif
       if (warp_id < num_channels) {
         constexpr int tma_batch_size = kNumTMABytesPerWarp - sizeof(uint64_t);
@@ -2660,6 +2659,7 @@ __global__ void __launch_bounds__((kNumForwarders + 1) * WARP_SIZE, 1)
                 channel_id,  // NOTE(MaoZiming): use channel_id for rb.
                 lane_id, 0, d2h_channel_addrs, num_d2h_channel_addrs, false, -1,
 #if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                0, 0
 #else
                 reinterpret_cast<uint64_t>(
                     rdma_channel_tail.buffer(rdma_rank)) -

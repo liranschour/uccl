@@ -1,4 +1,6 @@
+#include "fifo/d2c_fifo_device.hpp"
 #include "operator.h"
+#include "operators/operator.cuh"
 
 // TODO: ThunderKitten/Tilelang? based operators
 
@@ -77,19 +79,28 @@ template __device__ void run_reduce_inplace<__half>(CollArgs const&);
 
 // TODO: using sm id to assign task
 template <typename T>
-__global__ void basePersistentKernel(mscclpp::C2DDeviceHandle<T>* fifos,
+__global__ void basePersistentKernel(mscclpp::C2DDeviceHandle<T>* c2d_fifos,
+                                     mscclpp::SmDeviceHandle<T>* sm_fifos,
+                                     mscclpp::FifoDeviceHandle* d2c_fifo,
                                      CollArgs* d_coll, MoeArgs* d_moe,
-                                     bool* should_stop) {
+                                     GemmArgs* d_gemm, bool* should_stop) {
+  extern __shared__ char smem[];
   (void)d_moe;
 
   const uint32_t bid = blockIdx.x;
-  auto& fifo = fifos[bid];  // block => fifo
+  auto& fifo = c2d_fifos[bid];  // block => fifo
 
   while (true) {
     if (should_stop && *should_stop) break;
 
     T* task = fifo.poll();
     if (task == nullptr) continue;
+
+    /*
+    sm 2 sm 的任务，thread0
+    做任务boradcast，然后依次sync那几个被发布task的fifoHead，
+    等待并发的任务完成，其余sm 只 poll task，完成后thread0负责pop
+    */
 
     __syncthreads();
 
@@ -120,21 +131,37 @@ __global__ void basePersistentKernel(mscclpp::C2DDeviceHandle<T>* fifos,
         }
         break;
       }
+      case TaskType::TkGemm: {
+        GemmArgs const& ga = d_gemm[idx];
+        TkMatmulGlobals* g = (TkMatmulGlobals*)ga.globals;
+        run_tk_gemm(*g, ga.num_tile_rows, ga.num_tile_cols, smem);
+        break;
+      }
       default:
         break;
     }
 
     __threadfence();
+
     if (threadIdx.x == 0) {
+      // Push completion trigger to host
+      // if (d2c_fifo) {
+      //   mscclpp::ProxyTrigger trig(ttype, dtype, block_id, idx);
+      //   d2c_fifo->push(trig);
+      // }
+      // Pop task from C2D fifo
       fifo.pop();
     }
+
     __syncthreads();
   }
 }
 
 template __global__ void basePersistentKernel<Task>(
-    mscclpp::C2DDeviceHandle<Task>* fifos, CollArgs* d_coll, MoeArgs* d_moe,
-    bool* should_stop);
+    mscclpp::C2DDeviceHandle<Task>* c2d_fifos,
+    mscclpp::SmDeviceHandle<Task>* sm_fifos,
+    mscclpp::FifoDeviceHandle* d2c_fifo, CollArgs* d_coll, MoeArgs* d_moe,
+    GemmArgs* d_gemm, bool* should_stop);
 
 }  // namespace Compute
 }  // namespace UKernel

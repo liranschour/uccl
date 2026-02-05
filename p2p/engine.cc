@@ -93,9 +93,14 @@ Endpoint::Endpoint(uint32_t const local_gpu_idx, uint32_t const num_cpus)
   FLAGS_logtostderr = true;
   google::InstallFailureSignalHandler();
 
+#ifdef UCCL_P2P_USE_NCCL
+  ep_ = std::make_shared<tcp::TCPEndpoint>(local_gpu_idx_, 0);
+  numa_node_ = tcp::get_tcp_numa_node_from_iface();
+#else
   // Initialize the RDMA endpoint.
   ep_ = std::shared_ptr<NICEndpoint>(
       new NICEndpoint(local_gpu_idx_, INVALID_RANK_ID, 0, false));
+#endif
 
   std::cout << "Engine initialized for GPU " << local_gpu_idx_ << std::endl;
   engine_initialized_ = true;
@@ -104,6 +109,10 @@ Endpoint::Endpoint(uint32_t const local_gpu_idx, uint32_t const num_cpus)
       uccl::create_ring(sizeof(UnifiedTask*), kTaskRingSize);
   recv_unified_task_ring_ =
       uccl::create_ring(sizeof(UnifiedTask*), kTaskRingSize);
+
+#ifndef UCCL_P2P_USE_NCCL
+  numa_node_ = RdmaDeviceManager::instance().get_numa_node(local_gpu_idx_);
+#endif
 
   send_proxy_thread_ = std::thread(&Endpoint::send_proxy_thread_func, this);
   recv_proxy_thread_ = std::thread(&Endpoint::recv_proxy_thread_func, this);
@@ -135,9 +144,13 @@ Endpoint::Endpoint(uint32_t const num_cpus)
                  []() { google::InitGoogleLogging("uccl_p2p"); });
 
   google::InstallFailureSignalHandler();
+#ifdef UCCL_P2P_USE_NCCL
+  ep_ = std::make_shared<tcp::TCPEndpoint>(local_gpu_idx_, 0);
+#else
   // Initialize the RDMA endpoint with lazy creation.
   ep_ = std::shared_ptr<NICEndpoint>(
       new NICEndpoint(INVALID_GPU, INVALID_RANK_ID, 0, false));
+#endif
   std::cout << "Endpoint initialized successfully" << std::endl;
 }
 
@@ -197,7 +210,11 @@ void Endpoint::initialize_engine() {
     GPU_RT_CHECK(gpuStreamCreateWithFlags(&streams_[i], gpuStreamNonBlocking));
   }
 
+#ifdef UCCL_P2P_USE_NCCL
+  numa_node_ = tcp::get_tcp_numa_node_from_iface();
+#else
   numa_node_ = RdmaDeviceManager::instance().get_numa_node(local_gpu_idx_);
+#endif
 
   // Initialize rdma contexts for devices used by the GPU
   initialize_rdma_ctx_for_gpu(ep_, local_gpu_idx_);
@@ -575,16 +592,10 @@ bool Endpoint::sendv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     return false;
   }
 
-  if (num_iovs > kMaxVector) {
-    std::cerr << "[sendv] Error: num_iovs > kMaxVector (" << kMaxVector << ")"
-              << std::endl;
-    return false;
-  }
-
-  ucclRequest ureq[kMaxVector] = {};
-  bool sent[kMaxVector] = {false};
-  bool done[kMaxVector] = {false};
-  P2PMhandle* mhandles[kMaxVector] = {};
+  std::vector<ucclRequest> ureq(num_iovs);
+  std::vector<bool> sent(num_iovs, false);
+  std::vector<bool> done(num_iovs, false);
+  std::vector<P2PMhandle*> mhandles(num_iovs);
 
   // Check if mhandles are all valid
   for (int i = 0; i < num_iovs; i++) {
@@ -596,7 +607,7 @@ bool Endpoint::sendv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
   }
 
   while (1) {
-    for (int i = 0; i < num_iovs; i++) {
+    for (size_t i = 0; i < num_iovs; i++) {
       if (done[i]) continue;
       if (!sent[i]) {
         void* cur_data = (void*)data_v[i];
@@ -618,7 +629,7 @@ bool Endpoint::sendv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
       }
     }
 
-    if (std::all_of(done, done + num_iovs, [](bool b) { return b; })) {
+    if (std::all_of(done.begin(), done.end(), [](bool b) { return b; })) {
       break;
     }
 
@@ -637,16 +648,10 @@ bool Endpoint::recvv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     return false;
   }
 
-  if (num_iovs > kMaxVector) {
-    std::cerr << "[recvv] Error: num_iovs > kMaxVector (" << kMaxVector << ")"
-              << std::endl;
-    return false;
-  }
-
-  ucclRequest ureq[kMaxVector] = {};
-  bool done[kMaxVector] = {false};
-  bool received[kMaxVector] = {false};
-  P2PMhandle* mhandles[kMaxVector] = {};
+  std::vector<ucclRequest> ureq(num_iovs);
+  std::vector<bool> done(num_iovs, false);
+  std::vector<bool> received(num_iovs, false);
+  std::vector<P2PMhandle*> mhandles(num_iovs);
 
   // Check if mhandles are all valid
   for (int i = 0; i < num_iovs; i++) {
@@ -657,7 +662,7 @@ bool Endpoint::recvv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     }
   }
   while (1) {
-    for (int i = 0; i < num_iovs; i++) {
+    for (size_t i = 0; i < num_iovs; i++) {
       if (done[i]) continue;
 
       if (!received[i]) {
@@ -682,7 +687,7 @@ bool Endpoint::recvv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
       }
     }
 
-    if (std::all_of(done, done + num_iovs, [](bool b) { return b; })) {
+    if (std::all_of(done.begin(), done.end(), [](bool b) { return b; })) {
       break;
     }
 
@@ -711,12 +716,11 @@ bool Endpoint::read(uint64_t conn_id, uint64_t mr_id, void* dst, size_t size,
   FifoItem curr_slot_item = slot_item;
   curr_slot_item.size = size;
 
-  bool done = false;
-
   while (uccl_read_async(ep_, conn, mhandle, dst, size, curr_slot_item,
                          &ureq) == -1)
     ;
 
+  bool done = false;
   while (!done) {
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
     if (uccl_poll_ureq_once(ep_, &ureq)) {
@@ -813,51 +817,42 @@ bool Endpoint::readv(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     return false;
   }
 
-  if (num_iovs > kMaxVector) {
-    std::cerr << "[readv] Error: num_iovs > kMaxVector (" << kMaxVector << ")"
-              << std::endl;
-    return false;
-  }
+  ucclRequest ureq[kMaxInflightOps] = {};
+  bool done[kMaxInflightOps] = {false};
 
-  ucclRequest ureq[kMaxVector] = {};
-  FifoItem curr_slot_item[kMaxVector] = {};
-  bool done[kMaxVector] = {false};
-  bool read[kMaxVector] = {false};
-  P2PMhandle* mhandles[kMaxVector] = {};
+  size_t iov_issued = 0, iov_finished = 0;
 
-  // Check if mhandles are all valid
-  for (int i = 0; i < num_iovs; i++) {
-    mhandles[i] = get_mhandle(mr_id_v[i]);
-    if (unlikely(mhandles[i] == nullptr)) {
-      std::cerr << "[readv] Error: Invalid mr_id " << mr_id_v[i] << std::endl;
-      return false;
-    }
-  }
-
-  while (1) {
-    for (int i = 0; i < num_iovs; i++) {
-      if (done[i]) continue;
-
-      if (!read[i]) {
-        curr_slot_item[i] = slot_item_v[i];
-        auto mhandle = mhandles[i];
-        auto rc = uccl_read_async(ep_, conn, mhandle, dst_v[i], size_v[i],
-                                  curr_slot_item[i], &ureq[i]);
-        if (rc != -1) {
-          read[i] = true;
-        }
+  while (iov_finished < num_iovs) {
+    // Issue up to kMaxInflightOps IOVs
+    while (iov_issued < num_iovs &&
+           iov_issued - iov_finished < kMaxInflightOps) {
+      P2PMhandle* mhandle = get_mhandle(mr_id_v[iov_issued]);
+      if (unlikely(mhandle == nullptr)) {
+        std::cerr << "[readv] Error: Invalid mr_id " << mr_id_v[iov_issued]
+                  << std::endl;
+        return false;
       }
 
-      if (read[i] && !done[i]) {
-        if (uccl_poll_ureq_once(ep_, &ureq[i])) {
-          done[i] = true;
-        }
-      }
+      auto rc = uccl_read_async(ep_, conn, mhandle, dst_v[iov_issued],
+                                size_v[iov_issued], slot_item_v[iov_issued],
+                                &ureq[iov_issued % kMaxInflightOps]);
+      if (rc == -1) break;
+      done[iov_issued % kMaxInflightOps] = false;
+      iov_issued++;
     }
-    if (std::all_of(done, done + num_iovs, [](bool b) { return b; })) {
-      break;
-    }
+
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+
+    for (size_t i = iov_finished; i < iov_issued; i++) {
+      if (done[i % kMaxInflightOps]) continue;
+      if (uccl_poll_ureq_once(ep_, &ureq[i % kMaxInflightOps])) {
+        done[i % kMaxInflightOps] = true;
+      }
+    }
+
+    while (iov_finished < iov_issued && done[iov_finished % kMaxInflightOps]) {
+      iov_finished++;
+    }
   }
 
   return true;
@@ -921,54 +916,41 @@ bool Endpoint::writev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     return false;
   }
 
-  if (num_iovs > kMaxVector) {
-    std::cerr << "[writev] Error: num_iovs > kMaxVector (" << kMaxVector << ")"
-              << std::endl;
-    return false;
-  }
+  ucclRequest ureq[kMaxInflightOps] = {};
+  bool done[kMaxInflightOps] = {false};
 
-  ucclRequest ureq[kMaxVector] = {};
-  FifoItem curr_slot_item[kMaxVector] = {};
-  bool done[kMaxVector] = {false};
-  bool written[kMaxVector] = {false};
-  P2PMhandle* mhandles[kMaxVector] = {};
+  size_t iov_issued = 0, iov_finished = 0;
 
-  // Check if mhandles are all valid
-  for (int i = 0; i < num_iovs; i++) {
-    mhandles[i] = get_mhandle(mr_id_v[i]);
-    if (unlikely(mhandles[i] == nullptr)) {
-      std::cerr << "[writev] Error: Invalid mr_id " << mr_id_v[i] << std::endl;
-      return false;
-    }
-  }
-
-  while (1) {
-    for (int i = 0; i < num_iovs; i++) {
-      if (done[i]) continue;
-
-      if (!written[i]) {
-        curr_slot_item[i] = slot_item_v[i];
-
-        auto mhandle = mhandles[i];
-        auto rc = uccl_write_async(ep_, conn, mhandle, src_v[i], size_v[i],
-                                   curr_slot_item[i], &ureq[i]);
-        if (rc != -1) {
-          written[i] = true;
-        }
+  while (iov_finished < num_iovs) {
+    while (iov_issued < num_iovs &&
+           iov_issued - iov_finished < kMaxInflightOps) {
+      P2PMhandle* mhandle = get_mhandle(mr_id_v[iov_issued]);
+      if (unlikely(mhandle == nullptr)) {
+        std::cerr << "[writev] Error: Invalid mr_id " << mr_id_v[iov_issued]
+                  << std::endl;
+        return false;
       }
 
-      if (written[i] && !done[i]) {
-        if (uccl_poll_ureq_once(ep_, &ureq[i])) {
-          done[i] = true;
-        }
-      }
-    }
-
-    if (std::all_of(done, done + num_iovs, [](bool b) { return b; })) {
-      break;
+      auto rc = uccl_write_async(ep_, conn, mhandle, src_v[iov_issued],
+                                 size_v[iov_issued], slot_item_v[iov_issued],
+                                 &ureq[iov_issued % kMaxInflightOps]);
+      if (rc == -1) break;
+      done[iov_issued % kMaxInflightOps] = false;
+      iov_issued++;
     }
 
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+
+    for (size_t i = iov_finished; i < iov_issued; i++) {
+      if (done[i % kMaxInflightOps]) continue;
+      if (uccl_poll_ureq_once(ep_, &ureq[i % kMaxInflightOps])) {
+        done[i % kMaxInflightOps] = true;
+      }
+    }
+
+    while (iov_finished < iov_issued && done[iov_finished % kMaxInflightOps]) {
+      iov_finished++;
+    }
   }
 
   return true;
@@ -1014,17 +996,22 @@ bool Endpoint::write(uint64_t conn_id, uint64_t mr_id, void* src, size_t size,
     std::cerr << "[write] Error: Invalid mr_id " << mr_id << std::endl;
     return false;
   }
-
   ucclRequest ureq = {};
-  FifoItem cur_slot_item = slot_item;
-  cur_slot_item.size = size;
-  while (uccl_write_async(ep_, conn, mhandle, src, size, cur_slot_item,
+  FifoItem curr_slot_item = slot_item;
+  curr_slot_item.size = size;
+
+  while (uccl_write_async(ep_, conn, mhandle, src, size, curr_slot_item,
                           &ureq) == -1)
     ;
 
-  while (!uccl_poll_ureq_once(ep_, &ureq)) {
+  bool done = false;
+  while (!done) {
     auto _ = inside_python ? (check_python_signals(), nullptr) : nullptr;
+    if (uccl_poll_ureq_once(ep_, &ureq)) {
+      done = true;
+    }
   }
+
   return true;
 }
 
@@ -1045,6 +1032,15 @@ bool Endpoint::advertise(uint64_t conn_id, uint64_t mr_id, void* addr,
   return true;
 }
 
+bool Endpoint::prepare_fifo(uint64_t mr_id, void* addr, size_t len,
+                            char* out_buf) {
+  auto mhandle = mr_id_to_mr_[mr_id]->mhandle_;
+  // prepare_fifo_metadata doesn't actually use the endpoint or conn parameters
+  if (prepare_fifo_metadata(ep_, nullptr, mhandle, addr, len, out_buf) == -1)
+    return false;
+  return true;
+}
+
 bool Endpoint::advertisev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
                           std::vector<void*> addr_v, std::vector<size_t> len_v,
                           std::vector<char*> out_buf_v, size_t num_iovs) {
@@ -1053,13 +1049,9 @@ bool Endpoint::advertisev(uint64_t conn_id, std::vector<uint64_t> mr_id_v,
     std::cerr << "[advertisev] Error: Invalid conn_id " << conn_id << std::endl;
     return false;
   }
-  if (num_iovs > kMaxVector) {
-    std::cerr << "[advertisev] Error: num_iovs > kMaxVector (" << kMaxVector
-              << ")" << std::endl;
-    return false;
-  }
 
-  P2PMhandle* mhandles[kMaxVector] = {};
+  std::vector<P2PMhandle*> mhandles(num_iovs);
+
   // Check if mhandles are all valid
   for (int i = 0; i < num_iovs; i++) {
     mhandles[i] = get_mhandle(mr_id_v[i]);
@@ -1709,8 +1701,9 @@ void Endpoint::send_proxy_thread_func() {
                      << static_cast<int>(task->type);
           break;
       }
-      task->status_ptr->done.store(true, std::memory_order_release);
-      task->status_ptr->task_ptr.reset();
+      auto* status = task->status_ptr;
+      status->task_ptr.reset();
+      status->done.store(true, std::memory_order_release);
     }
   }
 }
@@ -1776,8 +1769,9 @@ void Endpoint::recv_proxy_thread_func() {
                      << static_cast<int>(task->type);
           break;
       }
-      task->status_ptr->done.store(true, std::memory_order_release);
-      task->status_ptr->task_ptr.reset();
+      auto* status = task->status_ptr;
+      status->task_ptr.reset();
+      status->done.store(true, std::memory_order_release);
     }
   }
 }

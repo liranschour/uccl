@@ -6,7 +6,7 @@ sudo apt-get update
 sudo apt-get install -y libelf-dev
 ```
 
-## transport develpment:
+## transport/runtime develpment:
 on AMD
 ```
 cd experimental/ukernel
@@ -24,6 +24,14 @@ make clean -f Makefile && make -j$(nproc) -f Makefile
 ```
 CUDA_VISIBLE_DEVICES=5 ./test_main --role=server
 CUDA_VISIBLE_DEVICES=5 ./test_main --role=client
+
+# notifier version transport
+CUDA_VISIBLE_DEVICES=5 ./test_main --role=server-notifier
+CUDA_VISIBLE_DEVICES=5 ./test_main --role=client-notifier
+```
+
+```
+CUDA_VISIBLE_DEVICES=5 python py/test_p2p.py
 ```
 
 
@@ -45,6 +53,7 @@ make clean -f Makefile && make -j$(nproc) -f Makefile
 CUDA_VISIBLE_DEVICES=5 ./test_persistent
 
 # bench
-CUDA_VISIBLE_DEVICES=5 ./bench_fifo
-CUDA_VISIBLE_DEVICES=5 ./bench_full_fifo
+CUDA_VISIBLE_DEVICES=5 ./benchmarks/bench_fifo
+CUDA_VISIBLE_DEVICES=5 ./benchmarks/bench_full_fifo
+CUDA_VISIBLE_DEVICES=5 ./benchmarks/bench_sm_fifo 83
 ```

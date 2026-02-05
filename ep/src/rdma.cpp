@@ -152,10 +152,15 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
 
     // Collect all NICs with equal minimum distance
     std::vector<std::string> candidates;
+#ifdef EFA
+    int num_efas = 0;
+#endif
     for (auto& p : dist) {
 #ifdef EFA
-      if (p.second == min_d && strncmp(p.first.c_str(), "rdmap", 5) == 0)
-        candidates.push_back(p.first);
+      if (strncmp(p.first.c_str(), "rdmap", 5) == 0) {
+        num_efas++;
+        if (p.second == min_d) candidates.push_back(p.first);
+      }
 #else
       if (!uccl::is_iface_up(p.first)) continue;
       if (p.second == min_d) candidates.push_back(p.first);
@@ -170,14 +175,13 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
       // For example, pass in `local_rank` or derive gpu_index from device path
       selected_nic_name = candidates[thread_idx % candidates.size()];
 #ifdef EFA
-      // NOTE(MaoZiming): This is a temporary hack.
-      if (candidates.size() == 8) {
-        // On p5, there are 8 NICs with the same distance.
-        auto half = (local_rank % 2) * 4;
-        // GPU0 uses candidates[0/1/2/3], GPU1 uses candidates[4/5/6/7], etc.
-        selected_nic_name = candidates[thread_idx % 4 + half];
+      if (num_efas == 32) {
+        assert(candidates.size() == 4);
+        // On p5, there are 4 NICs with the same distance.
+        selected_nic_name = candidates[thread_idx % 4];
         use_ll_sl = true;
-      } else if (candidates.size() == 4) {
+      } else if (num_efas == 16) {
+        assert(candidates.size() == 4);
         // On p5e/p5en, there are 4 NICs with the same distance.
         // We hardcode the first half Proxies to use the first NIC, and the
         // second half to use the second NIC.
@@ -187,6 +191,7 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
         use_ll_sl = true;
       } else {
         // On p6-b200, there is 2 NICs with the same distance.
+        assert(num_efas == 8);
         assert(candidates.size() == 2);
         auto half = (local_rank % 2) * 1;
         selected_nic_name = candidates[thread_idx % 1 + half];
@@ -229,8 +234,8 @@ void per_thread_rdma_init(ProxyCtx& S, void* gpu_buf, size_t bytes, int rank,
 #ifndef EFA
   S.mr = ibv_reg_mr_iova2(S.pd, gpu_buf, bytes, iova,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
-                              IBV_ACCESS_REMOTE_ATOMIC |
-                              IBV_ACCESS_RELAXED_ORDERING);
+                              IBV_ACCESS_REMOTE_ATOMIC);
+  // | IBV_ACCESS_RELAXED_ORDERING
 #else
   S.mr = ibv_reg_mr_iova2(S.pd, gpu_buf, bytes, iova,
                           IBV_ACCESS_LOCAL_WRITE | IBV_ACCESS_REMOTE_WRITE |
@@ -575,10 +580,12 @@ void modify_qp_to_rtr(ProxyCtx& S, RDMAConnectionInfo* remote,
   if (is_roce) {
     attr.ah_attr.is_global = 1;
     attr.ah_attr.port_num = 1;
-    attr.ah_attr.sl = 135;
+    char const* sl_env = getenv("UCCL_IB_SL");
+    attr.ah_attr.sl = sl_env ? atoi(sl_env) : 3;
     attr.ah_attr.src_path_bits = 0;
-    attr.ah_attr.grh.traffic_class = 3;
-    attr.ah_attr.grh.hop_limit = 64;
+    char const* tc_env = getenv("UCCL_IB_TC");
+    attr.ah_attr.grh.traffic_class = tc_env ? atoi(tc_env) : 104;
+    attr.ah_attr.grh.hop_limit = 255;
     // Fill GID from remote_info
     memcpy(&attr.ah_attr.grh.dgid, remote->gid, 16);
     attr.ah_attr.grh.sgid_index = S.gid_index;
@@ -930,7 +937,7 @@ static void post_rdma_async_batched_normal_mode(
           wrs[j].wr.rdma.remote_addr = remote_addr;
           wrs[j].wr.rdma.rkey = ctx->remote_rkey;
           wrs[j].opcode = IBV_WR_RDMA_WRITE;  // default
-          wrs[j].send_flags = (j + 1 == kgroup) ? IBV_SEND_SIGNALED : 0;
+          wrs[j].send_flags = IBV_SEND_SIGNALED;
           wrs[j].next = (j + 1 < kgroup) ? &wrs[j + 1] : nullptr;
 
           if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
@@ -1051,7 +1058,7 @@ static void post_rdma_async_batched_normal_mode(
           wrs[j].wr.rdma.remote_addr = remote_addr;
           wrs[j].wr.rdma.rkey = ctx->remote_rkey;
           wrs[j].opcode = IBV_WR_RDMA_WRITE;  // default
-          wrs[j].send_flags = (j + 1 == kgroup) ? IBV_SEND_SIGNALED : 0;
+          wrs[j].send_flags = IBV_SEND_SIGNALED;
           wrs[j].next = (j + 1 < kgroup) ? &wrs[j + 1] : nullptr;
 
           if (cmd.atomic_offset > 0 && cmd.atomic_val > 0) {
@@ -1295,7 +1302,7 @@ static void post_rdma_async_batched_fast_mode(
 
       wrs[j].wr.rdma.rkey = ctx->remote_rkey;
       wrs[j].opcode = IBV_WR_RDMA_WRITE;
-      wrs[j].send_flags = 0;
+      wrs[j].send_flags = IBV_SEND_SIGNALED;
       wrs[j].next = (j + 1 < k) ? &wrs[j + 1] : nullptr;
     }
     size_t const last = k - 1;
@@ -1413,10 +1420,11 @@ void local_process_completions(ProxyCtx& S,
               acked_wrs.insert(sub_wr);
             }
             S.wr_id_to_wr_ids.erase(it);
-          } else {
-            printf("Error: Write ACK for unknown wr_id %lu\n", wr_done);
-            std::abort();
           }
+          // else {
+          //   printf("Error: Write ACK for unknown wr_id %lu\n", wr_done);
+          //   std::abort();
+          // }
 #endif
         }
       } break;
@@ -1434,12 +1442,14 @@ void local_process_completions(ProxyCtx& S,
             acked_wrs.insert(sub_wr);
           }
           S.wr_id_to_wr_ids.erase(it);
-        } else {
-          fprintf(stderr,
-                  "[Atomic] No batch found for wr_id=0x%lx, treating as single "
-                  "(map_size=%zu)\n",
-                  wrid, S.wr_id_to_wr_ids.size());
         }
+        // else {
+        //   fprintf(stderr,
+        //           "[Atomic] No batch found for wr_id=0x%lx, treating as
+        //           single "
+        //           "(map_size=%zu)\n",
+        //           wrid, S.wr_id_to_wr_ids.size());
+        // }
       } break;
       default:
         break;
@@ -2253,7 +2263,7 @@ static void post_atomic_operations_normal_mode(
         std::memset(&wr[t], 0, sizeof(wr[t]));
         wr[t].wr_id = kAtomicWrTag | (wr_id & kAtomicMask);
         wr[t].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-        wr[t].send_flags = (t + 1 == k) ? IBV_SEND_SIGNALED : 0;
+        wr[t].send_flags = IBV_SEND_SIGNALED;
         wr[t].imm_data = htonl(imm);
         wr[t].sg_list = &sge[t];
         wr[t].num_sge = 1;
@@ -2395,7 +2405,7 @@ static void post_atomic_operations_fast_mode(
       std::memset(&wr[i], 0, sizeof(wr[i]));
       wr[i].wr_id = kAtomicWrTag | (wrid & kAtomicMask);
       wr[i].opcode = IBV_WR_RDMA_WRITE_WITH_IMM;
-      wr[i].send_flags = (i + 1 == k) ? IBV_SEND_SIGNALED : 0;
+      wr[i].send_flags = IBV_SEND_SIGNALED;
       wr[i].imm_data = htonl(imm);
       wr[i].sg_list = &sge[i];
       wr[i].num_sge = 1;
@@ -2561,7 +2571,7 @@ static void post_atomic_operations_fast_mode_native_rdma(
       std::memset(&wr[t], 0, sizeof(wr[t]));
       wr[t].wr_id = wr_id;
       wr[t].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
-      wr[t].send_flags = (t + 1 == k) ? IBV_SEND_SIGNALED : 0;
+      wr[t].send_flags = IBV_SEND_SIGNALED;
       wr[t].sg_list = &sge[t];
       wr[t].num_sge = 1;
       wr[t].wr.atomic.remote_addr = remote_atomic_addr;
@@ -2733,7 +2743,7 @@ static void post_atomic_operations_native_rdma(
         std::memset(&wr[t], 0, sizeof(wr[t]));
         wr[t].wr_id = wr_id;
         wr[t].opcode = IBV_WR_ATOMIC_FETCH_AND_ADD;
-        wr[t].send_flags = (t + 1 == k) ? IBV_SEND_SIGNALED : 0;
+        wr[t].send_flags = IBV_SEND_SIGNALED;
         wr[t].sg_list = &sge[t];
         wr[t].num_sge = 1;
         wr[t].wr.atomic.remote_addr = remote_atomic_addr;

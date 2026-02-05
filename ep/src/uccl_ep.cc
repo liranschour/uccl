@@ -191,6 +191,11 @@ class Buffer {
     CUDA_CHECK(cudaGetDeviceProperties(&prop, device_index));
     num_device_sms = prop.multiProcessorCount;
 
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+    fp8_dtype = strcmp(prop.gcnArchName, "gfx942") == 0
+                    ? torch::kFloat8_e4m3fnuz
+                    : torch::kFloat8_e4m3fn;
+#endif
     if (num_nvl_bytes > 0) {
       size_t total_bytes = static_cast<size_t>(num_nvl_bytes) +
                            static_cast<size_t>(barrier_signal_bytes) +
@@ -244,7 +249,7 @@ class Buffer {
                               cudaHostAllocMapped));
     CUDA_CHECK(cudaHostGetDevicePointer(
         reinterpret_cast<void**>(&moe_recv_expert_counter_mapped),
-        moe_recv_expert_counter, 0));
+        const_cast<int*>(moe_recv_expert_counter), 0));
     for (int i = 0; i < NUM_MAX_LOCAL_EXPERTS; ++i)
       moe_recv_expert_counter[i] = -1;
 
@@ -253,7 +258,7 @@ class Buffer {
                                 cudaHostAllocMapped));
       CUDA_CHECK(cudaHostGetDevicePointer(
           reinterpret_cast<void**>(&moe_recv_rdma_counter_mapped),
-          moe_recv_rdma_counter, 0));
+          const_cast<int*>(moe_recv_rdma_counter), 0));
       *moe_recv_rdma_counter = -1;
     }
   }
@@ -1473,8 +1478,8 @@ class Buffer {
         torch::empty({num_local_experts,
                       num_ranks * num_max_dispatch_tokens_per_rank, hidden},
                      x.options().dtype(use_fp8 ?
-#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__) && defined(__gfx942__)
-                                               torch::kFloat8_e4m3fnuz
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+                                               fp8_dtype
 #else
                                                torch::kFloat8_e4m3fn
 #endif
@@ -1931,13 +1936,16 @@ class Buffer {
   cudaIpcMemHandle_t rdma_ipc_handles[NUM_MAX_NVL_PEERS]{};
   void* ipc_rdma_base_ptrs[NUM_MAX_NVL_PEERS]{};
 
+  // clang-format would change to int volatile*
+  // clang-format off
   // MoE counters (host mapped)
-  int volatile* moe_recv_counter = nullptr;
+  volatile int* moe_recv_counter = nullptr;
   int* moe_recv_counter_mapped{nullptr};  // device pointer
-  int* moe_recv_expert_counter{nullptr};
+  volatile int* moe_recv_expert_counter{nullptr};
   int* moe_recv_expert_counter_mapped{nullptr};
-  int* moe_recv_rdma_counter{nullptr};
+  volatile int* moe_recv_rdma_counter{nullptr};
   int* moe_recv_rdma_counter_mapped{nullptr};
+  // clang-format on
 
   bool destroyed = false;
 
@@ -1949,6 +1957,11 @@ class Buffer {
   // IPC base pointers for GPU access (for replacing nvshmemi_get_p2p_ptr)
   void** d_ipc_rdma_base_ptrs{
       nullptr};  // Device pointer to array of IPC base addresses
+
+#if defined(__HIP_PLATFORM_AMD__) || defined(__HIPCC__)
+  // support select fp8 dtype for different gcn arch in runtime
+  c10::ScalarType fp8_dtype{torch::kFloat8_e4m3fnuz};
+#endif
 };
 
 PYBIND11_MODULE(ep, m) {
