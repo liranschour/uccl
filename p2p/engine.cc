@@ -1158,57 +1158,137 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
   auto dev_reset =
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
-  IpcTransferInfo transfer_info = {};  // Initialize to zero
-  // Wait for receiver's IPC handle (receiver will send this proactively)
+  // Detect if sender's data is CPU or GPU memory
+  int send_dev_idx = uccl::get_dev_idx(data);
+  bool send_is_gpu = (send_dev_idx >= 0);
+
+  LOG(INFO) << "[send_ipc] conn_id=" << conn_id << " size=" << size
+            << " sender_mem=" << (send_is_gpu ? "GPU" : "CPU")
+            << (send_is_gpu ? (" dev=" + std::to_string(send_dev_idx)) : "");
+
+  // Exchange memory type information
+  // Receive receiver's memory type first
+  uint32_t recv_mem_type = 0;
   auto ret = uccl::receive_message_nonblock(
-      sockfd, static_cast<void*>(&transfer_info), sizeof(transfer_info));
-  CHECK_EQ(ret, sizeof(transfer_info))
-      << "Failed to receive IPC handle from receiver";
-  CHECK_EQ(transfer_info.operation, 1) << "Invalid response from receiver";
-  CHECK_EQ(transfer_info.size, size)
-      << "Size mismatch: expected " << size << ", got " << transfer_info.size;
+      sockfd, static_cast<void*>(&recv_mem_type), sizeof(recv_mem_type));
+  CHECK_EQ(ret, sizeof(recv_mem_type)) << "Failed to receive receiver memory type";
 
-  void* base = nullptr;
-  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
-  GPU_RT_CHECK(gpuIpcOpenMemHandle(&base, transfer_info.handle,
-                                   gpuIpcMemLazyEnablePeerAccess));
-  void* dst_ptr = reinterpret_cast<void*>(reinterpret_cast<uintptr_t>(base) +
-                                          transfer_info.offset);
-
-  std::vector<gpuStream_t>& dst_streams = ipc_streams_[conn->remote_gpu_idx_];
-  int num_streams =
-      std::min(dst_streams.size(),
-               size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
-  size_t chunk_size = size / num_streams;
-
-  for (int i = 0; i < num_streams; ++i) {
-    // Split data and dst_ptr into n_streams chunks
-    void* chunk_data = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(data) + i * chunk_size);
-    void* chunk_dst_ptr = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
-    auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
-    // Works for both intra-GPU and inter-GPU copy
-    GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
-                                gpuMemcpyDeviceToDevice, dst_streams[i]));
-  }
-
-  for (auto& stream : dst_streams) {
-    GPU_RT_CHECK(gpuStreamSynchronize(stream));
-  }
-
-  // Notify receiver of completion
-  uint32_t completion = 1;
+  // Send our memory type: 0=CPU, 1=GPU
+  uint32_t send_mem_type = send_is_gpu ? 1 : 0;
   ret = uccl::send_message_nonblock(
-      sockfd, static_cast<void const*>(&completion), sizeof(completion));
-  CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
+      sockfd, static_cast<void const*>(&send_mem_type), sizeof(send_mem_type));
+  CHECK_EQ(ret, sizeof(send_mem_type)) << "Failed to send memory type";
 
-  // Okay, this is the slowest part, 46GB/s -> 28GB/s for 100MB, so moving it
-  // async. Update: moving async does not help, as gpuIpcOpenMemHandle will be
-  // slower.
-  // std::thread close_mem_handle(
-  //     [dst_ptr]() { GPU_RT_CHECK(gpuIpcCloseMemHandle(dst_ptr)); });
-  // close_mem_handle.detach();
+  bool recv_is_gpu = (recv_mem_type == 1);
+
+  LOG(INFO) << "[send_ipc] Memory negotiation complete: "
+            << (send_is_gpu ? "GPU" : "CPU") << " -> "
+            << (recv_is_gpu ? "GPU" : "CPU");
+
+  // Decide protocol based on memory types
+  if (recv_is_gpu) {
+    // Receiver has GPU: Use push model (sender writes to receiver's GPU)
+    LOG(INFO) << "[send_ipc] Using PUSH model (sender writes to receiver's GPU)";
+    IpcTransferInfo transfer_info = {};
+    ret = uccl::receive_message_nonblock(
+        sockfd, static_cast<void*>(&transfer_info), sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to receive IPC handle from receiver";
+    CHECK_EQ(transfer_info.operation, 1) << "Invalid response from receiver";
+    CHECK_EQ(transfer_info.size, size)
+        << "Size mismatch: expected " << size << ", got " << transfer_info.size;
+
+    // Open receiver's GPU memory
+    void* base = nullptr;
+    GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&base, transfer_info.handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+    void* dst_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(base) + transfer_info.offset);
+
+    LOG(INFO) << "[send_ipc] Copy kind: "
+              << (send_is_gpu ? "DeviceToDevice" : "HostToDevice");
+
+    std::vector<gpuStream_t>& dst_streams = ipc_streams_[conn->remote_gpu_idx_];
+    int num_streams =
+        std::min(dst_streams.size(),
+                 size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
+
+    // For CPU->GPU, use single stream (CPU doesn't benefit from multiple streams)
+    if (!send_is_gpu) {
+      num_streams = 1;
+    }
+
+    LOG(INFO) << "[send_ipc] Using " << num_streams << " stream(s) for transfer";
+
+    size_t chunk_size = size / num_streams;
+
+    for (int i = 0; i < num_streams; ++i) {
+      void* chunk_data = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(data) + i * chunk_size);
+      void* chunk_dst_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
+      auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
+
+      // CPU side calls cudaMemcpy if sender is CPU
+      if (send_is_gpu) {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
+                                    gpuMemcpyDeviceToDevice, dst_streams[i]));
+      } else {
+        GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
+                                    gpuMemcpyHostToDevice, dst_streams[i]));
+      }
+    }
+
+    for (int i = 0; i < num_streams; ++i) {
+      GPU_RT_CHECK(gpuStreamSynchronize(dst_streams[i]));
+    }
+
+    // Notify receiver of completion
+    uint32_t completion = 1;
+    ret = uccl::send_message_nonblock(
+        sockfd, static_cast<void const*>(&completion), sizeof(completion));
+    CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
+
+    LOG(INFO) << "[send_ipc] PUSH model transfer completed successfully";
+  } else {
+    // Receiver has CPU: Use pull model (sender provides IPC handle)
+    LOG(INFO) << "[send_ipc] Using PULL model (receiver reads from sender's GPU)";
+
+    CHECK(send_is_gpu) << "send_ipc: CPU-to-CPU transfer not supported via IPC";
+
+    GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
+
+    // Create IPC handle for sender's GPU buffer
+    IpcTransferInfo transfer_info = {};
+    transfer_info.size = size;
+    transfer_info.operation = 1;
+    GPU_RT_CHECK(
+        gpuIpcGetMemHandle(&transfer_info.handle, reinterpret_cast<void*>(data)));
+
+    // Getting the base address
+    void* base = nullptr;
+    size_t base_size;
+    GPU_RT_CHECK(gpuMemGetAddressRange(&base, &base_size, data));
+    auto data_offset =
+        reinterpret_cast<uintptr_t>(data) - reinterpret_cast<uintptr_t>(base);
+    transfer_info.offset = data_offset;
+
+    // Send IPC handle to receiver
+    ret = uccl::send_message_nonblock(
+        sockfd, static_cast<void const*>(&transfer_info), sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info)) << "Failed to send IPC handle to receiver";
+
+    // Wait for receiver to complete the copy
+    uint32_t completion = 0;
+    ret = uccl::receive_message_nonblock(
+        sockfd, static_cast<void*>(&completion), sizeof(completion));
+    CHECK_EQ(ret, sizeof(completion))
+        << "Failed to receive completion notification";
+    CHECK_EQ(completion, 1) << "Receiver reported failure";
+
+    LOG(INFO) << "[send_ipc] PULL model transfer completed successfully";
+  }
 
   // We close all IPC memory handles when releasing this endpoint.
 
@@ -1239,33 +1319,102 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
 
   GPU_RT_CHECK(gpuSetDevice(local_gpu_idx_));
-  // Generate IPC memory handle for our receive buffer
-  IpcTransferInfo transfer_info = {};  // Initialize to zero
-  transfer_info.size = size;
-  transfer_info.operation = 1;  // response
-  GPU_RT_CHECK(
-      gpuIpcGetMemHandle(&transfer_info.handle, reinterpret_cast<void*>(data)));
 
-  // Getting the base address.
-  void* base = nullptr;
-  size_t base_size;
-  GPU_RT_CHECK(gpuMemGetAddressRange(&base, &base_size, data));
-  auto data_offset =
-      reinterpret_cast<uintptr_t>(data) - reinterpret_cast<uintptr_t>(base);
-  transfer_info.offset = data_offset;
+  // Detect if receiver's data is CPU or GPU memory
+  int recv_dev_idx = uccl::get_dev_idx(data);
+  bool recv_is_gpu = (recv_dev_idx >= 0);
 
+  LOG(INFO) << "[recv_ipc] conn_id=" << conn_id << " size=" << size
+            << " receiver_mem=" << (recv_is_gpu ? "GPU" : "CPU")
+            << (recv_is_gpu ? (" dev=" + std::to_string(recv_dev_idx)) : "");
+
+  // Exchange memory type information
+  // Send: 0=CPU, 1=GPU
+  uint32_t recv_mem_type = recv_is_gpu ? 1 : 0;
   auto ret = uccl::send_message_nonblock(
-      client_fd, static_cast<void const*>(&transfer_info),
-      sizeof(transfer_info));
-  CHECK_EQ(ret, sizeof(transfer_info)) << "Failed to send IPC handle to sender";
+      client_fd, static_cast<void const*>(&recv_mem_type), sizeof(recv_mem_type));
+  CHECK_EQ(ret, sizeof(recv_mem_type)) << "Failed to send memory type";
 
-  // Notify sender of completion
-  uint32_t completion = 0;
+  // Receive sender's memory type
+  uint32_t send_mem_type = 0;
   ret = uccl::receive_message_nonblock(
-      client_fd, static_cast<void*>(&completion), sizeof(completion));
-  CHECK_EQ(ret, sizeof(completion))
-      << "Failed to receive completion notification";
-  CHECK_EQ(completion, 1) << "Sender reported failure";
+      client_fd, static_cast<void*>(&send_mem_type), sizeof(send_mem_type));
+  CHECK_EQ(ret, sizeof(send_mem_type)) << "Failed to receive sender memory type";
+
+  bool send_is_gpu = (send_mem_type == 1);
+
+  LOG(INFO) << "[recv_ipc] Memory negotiation complete: "
+            << (send_is_gpu ? "GPU" : "CPU") << " -> "
+            << (recv_is_gpu ? "GPU" : "CPU");
+
+  // Decide protocol based on memory types
+  if (recv_is_gpu) {
+    // Receiver has GPU: Create IPC handle (push model)
+    LOG(INFO) << "[recv_ipc] Using PUSH model (sender writes to receiver's GPU)";
+    IpcTransferInfo transfer_info = {};
+    transfer_info.size = size;
+    transfer_info.operation = 1;  // response
+    GPU_RT_CHECK(
+        gpuIpcGetMemHandle(&transfer_info.handle, reinterpret_cast<void*>(data)));
+
+    // Getting the base address
+    void* base = nullptr;
+    size_t base_size;
+    GPU_RT_CHECK(gpuMemGetAddressRange(&base, &base_size, data));
+    auto data_offset =
+        reinterpret_cast<uintptr_t>(data) - reinterpret_cast<uintptr_t>(base);
+    transfer_info.offset = data_offset;
+
+    ret = uccl::send_message_nonblock(
+        client_fd, static_cast<void const*>(&transfer_info),
+        sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info)) << "Failed to send IPC handle to sender";
+
+    // Wait for sender to complete
+    uint32_t completion = 0;
+    ret = uccl::receive_message_nonblock(
+        client_fd, static_cast<void*>(&completion), sizeof(completion));
+    CHECK_EQ(ret, sizeof(completion))
+        << "Failed to receive completion notification";
+    CHECK_EQ(completion, 1) << "Sender reported failure";
+
+    LOG(INFO) << "[recv_ipc] PUSH model transfer completed successfully";
+  } else {
+    // Receiver has CPU: Request sender's IPC handle (pull model)
+    LOG(INFO) << "[recv_ipc] Using PULL model (receiver reads from sender's GPU)";
+
+    CHECK(send_is_gpu) << "recv_ipc: CPU-to-CPU transfer not supported via IPC";
+
+    // Receive sender's IPC handle
+    IpcTransferInfo transfer_info = {};
+    ret = uccl::receive_message_nonblock(
+        client_fd, static_cast<void*>(&transfer_info), sizeof(transfer_info));
+    CHECK_EQ(ret, sizeof(transfer_info))
+        << "Failed to receive IPC handle from sender";
+    CHECK_EQ(transfer_info.size, size)
+        << "Size mismatch: expected " << size << ", got " << transfer_info.size;
+
+    // Open sender's GPU memory
+    void* base = nullptr;
+    GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&base, transfer_info.handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+    void* src_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(base) + transfer_info.offset);
+
+    // Copy from sender's GPU to receiver's CPU
+    // CPU side calls cudaMemcpy (best practice)
+    LOG(INFO) << "[recv_ipc] Copying GPU->CPU using DeviceToHost";
+    GPU_RT_CHECK(gpuMemcpy(data, src_ptr, size, gpuMemcpyDeviceToHost));
+
+    // Notify sender of completion
+    uint32_t completion = 1;
+    ret = uccl::send_message_nonblock(
+        client_fd, static_cast<void const*>(&completion), sizeof(completion));
+    CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
+
+    LOG(INFO) << "[recv_ipc] PULL model transfer completed successfully";
+  }
 
   return true;
 }
