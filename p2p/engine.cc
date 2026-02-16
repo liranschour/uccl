@@ -1162,10 +1162,6 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
   int send_dev_idx = uccl::get_dev_idx(data);
   bool send_is_gpu = (send_dev_idx >= 0);
 
-  LOG(INFO) << "[send_ipc] conn_id=" << conn_id << " size=" << size
-            << " sender_mem=" << (send_is_gpu ? "GPU" : "CPU")
-            << (send_is_gpu ? (" dev=" + std::to_string(send_dev_idx)) : "");
-
   // Exchange memory type information
   // Receive receiver's memory type first
   uint32_t recv_mem_type = 0;
@@ -1181,14 +1177,9 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
 
   bool recv_is_gpu = (recv_mem_type == 1);
 
-  LOG(INFO) << "[send_ipc] Memory negotiation complete: "
-            << (send_is_gpu ? "GPU" : "CPU") << " -> "
-            << (recv_is_gpu ? "GPU" : "CPU");
-
   // Decide protocol based on memory types
   if (recv_is_gpu) {
     // Receiver has GPU: Use push model (sender writes to receiver's GPU)
-    LOG(INFO) << "[send_ipc] Using PUSH model (sender writes to receiver's GPU)";
     IpcTransferInfo transfer_info = {};
     ret = uccl::receive_message_nonblock(
         sockfd, static_cast<void*>(&transfer_info), sizeof(transfer_info));
@@ -1206,9 +1197,6 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
     void* dst_ptr = reinterpret_cast<void*>(
         reinterpret_cast<uintptr_t>(base) + transfer_info.offset);
 
-    LOG(INFO) << "[send_ipc] Copy kind: "
-              << (send_is_gpu ? "DeviceToDevice" : "HostToDevice");
-
     std::vector<gpuStream_t>& dst_streams = ipc_streams_[conn->remote_gpu_idx_];
     int num_streams =
         std::min(dst_streams.size(),
@@ -1218,8 +1206,6 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
     if (!send_is_gpu) {
       num_streams = 1;
     }
-
-    LOG(INFO) << "[send_ipc] Using " << num_streams << " stream(s) for transfer";
 
     size_t chunk_size = size / num_streams;
 
@@ -1250,10 +1236,8 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
         sockfd, static_cast<void const*>(&completion), sizeof(completion));
     CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
 
-    LOG(INFO) << "[send_ipc] PUSH model transfer completed successfully";
   } else {
     // Receiver has CPU: Use pull model (sender provides IPC handle)
-    LOG(INFO) << "[send_ipc] Using PULL model (receiver reads from sender's GPU)";
 
     CHECK(send_is_gpu) << "send_ipc: CPU-to-CPU transfer not supported via IPC";
 
@@ -1287,7 +1271,6 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
         << "Failed to receive completion notification";
     CHECK_EQ(completion, 1) << "Receiver reported failure";
 
-    LOG(INFO) << "[send_ipc] PULL model transfer completed successfully";
   }
 
   // We close all IPC memory handles when releasing this endpoint.
@@ -1324,10 +1307,6 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
   int recv_dev_idx = uccl::get_dev_idx(data);
   bool recv_is_gpu = (recv_dev_idx >= 0);
 
-  LOG(INFO) << "[recv_ipc] conn_id=" << conn_id << " size=" << size
-            << " receiver_mem=" << (recv_is_gpu ? "GPU" : "CPU")
-            << (recv_is_gpu ? (" dev=" + std::to_string(recv_dev_idx)) : "");
-
   // Exchange memory type information
   // Send: 0=CPU, 1=GPU
   uint32_t recv_mem_type = recv_is_gpu ? 1 : 0;
@@ -1343,14 +1322,9 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
 
   bool send_is_gpu = (send_mem_type == 1);
 
-  LOG(INFO) << "[recv_ipc] Memory negotiation complete: "
-            << (send_is_gpu ? "GPU" : "CPU") << " -> "
-            << (recv_is_gpu ? "GPU" : "CPU");
-
   // Decide protocol based on memory types
   if (recv_is_gpu) {
     // Receiver has GPU: Create IPC handle (push model)
-    LOG(INFO) << "[recv_ipc] Using PUSH model (sender writes to receiver's GPU)";
     IpcTransferInfo transfer_info = {};
     transfer_info.size = size;
     transfer_info.operation = 1;  // response
@@ -1378,10 +1352,8 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
         << "Failed to receive completion notification";
     CHECK_EQ(completion, 1) << "Sender reported failure";
 
-    LOG(INFO) << "[recv_ipc] PUSH model transfer completed successfully";
   } else {
     // Receiver has CPU: Request sender's IPC handle (pull model)
-    LOG(INFO) << "[recv_ipc] Using PULL model (receiver reads from sender's GPU)";
 
     CHECK(send_is_gpu) << "recv_ipc: CPU-to-CPU transfer not supported via IPC";
 
@@ -1404,7 +1376,6 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
 
     // Copy from sender's GPU to receiver's CPU
     // CPU side calls cudaMemcpy (best practice)
-    LOG(INFO) << "[recv_ipc] Copying GPU->CPU using DeviceToHost";
     GPU_RT_CHECK(gpuMemcpy(data, src_ptr, size, gpuMemcpyDeviceToHost));
 
     // Notify sender of completion
@@ -1413,7 +1384,6 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
         client_fd, static_cast<void const*>(&completion), sizeof(completion));
     CHECK_EQ(ret, sizeof(completion)) << "Failed to send completion ack";
 
-    LOG(INFO) << "[recv_ipc] PULL model transfer completed successfully";
   }
 
   return true;
