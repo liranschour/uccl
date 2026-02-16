@@ -1470,11 +1470,20 @@ bool Endpoint::write_ipc(uint64_t conn_id, void const* data, size_t size,
   void* dst_ptr = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(raw_dst_ptr) + info.offset);
 
+  // Detect if source data is CPU or GPU memory
+  bool src_is_gpu = (uccl::get_dev_idx(const_cast<void*>(data)) >= 0);
+
   // Perform the memory copy using multiple streams for better performance
   std::vector<gpuStream_t>& dst_streams = ipc_streams_[conn->remote_gpu_idx_];
   int num_streams =
       std::min(dst_streams.size(),
                size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
+
+  // For CPU->GPU, use single stream (CPU doesn't benefit from multiple streams)
+  if (!src_is_gpu) {
+    num_streams = 1;
+  }
+
   size_t chunk_size = size / num_streams;
 
   for (int i = 0; i < num_streams; ++i) {
@@ -1485,9 +1494,13 @@ bool Endpoint::write_ipc(uint64_t conn_id, void const* data, size_t size,
         reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
 
-    // Works for both intra-GPU and inter-GPU copy
-    GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
-                                gpuMemcpyDeviceToDevice, dst_streams[i]));
+    if (src_is_gpu) {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
+                                  gpuMemcpyDeviceToDevice, dst_streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_dst_ptr, chunk_data, copy_size,
+                                  gpuMemcpyHostToDevice, dst_streams[i]));
+    }
   }
 
   // Wait for all streams to complete
@@ -1527,11 +1540,20 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
   void* src_ptr = reinterpret_cast<void*>(
       reinterpret_cast<uintptr_t>(raw_src_ptr) + info.offset);
 
+  // Detect if destination data is CPU or GPU memory
+  bool dst_is_gpu = (uccl::get_dev_idx(data) >= 0);
+
   // Perform the memory copy using multiple streams for better performance
   std::vector<gpuStream_t>& src_streams = ipc_streams_[conn->remote_gpu_idx_];
   int num_streams =
       std::min(src_streams.size(),
                size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
+
+  // For GPU->CPU, use single stream
+  if (!dst_is_gpu) {
+    num_streams = 1;
+  }
+
   size_t chunk_size = size / num_streams;
 
   for (int i = 0; i < num_streams; ++i) {
@@ -1542,9 +1564,13 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
         reinterpret_cast<uintptr_t>(data) + i * chunk_size);
     auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
 
-    // Works for both intra-GPU and inter-GPU copy
-    GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src_ptr, copy_size,
-                                gpuMemcpyDeviceToDevice, src_streams[i]));
+    if (dst_is_gpu) {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src_ptr, copy_size,
+                                  gpuMemcpyDeviceToDevice, src_streams[i]));
+    } else {
+      GPU_RT_CHECK(gpuMemcpyAsync(chunk_data, chunk_src_ptr, copy_size,
+                                  gpuMemcpyDeviceToHost, src_streams[i]));
+    }
   }
 
   // Wait for all streams to complete
