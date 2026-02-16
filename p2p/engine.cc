@@ -1230,6 +1230,9 @@ bool Endpoint::send_ipc(uint64_t conn_id, void* data, size_t size) {
       GPU_RT_CHECK(gpuStreamSynchronize(dst_streams[i]));
     }
 
+    // Close the IPC memory handle
+    GPU_RT_CHECK(gpuIpcCloseMemHandle(base));
+
     // Notify receiver of completion
     uint32_t completion = 1;
     ret = uccl::send_message_nonblock(
@@ -1377,6 +1380,9 @@ bool Endpoint::recv_ipc(uint64_t conn_id, void* data, size_t size) {
     // Copy from sender's GPU to receiver's CPU
     // CPU side calls cudaMemcpy (best practice)
     GPU_RT_CHECK(gpuMemcpy(data, src_ptr, size, gpuMemcpyDeviceToHost));
+
+    // Close the IPC memory handle
+    GPU_RT_CHECK(gpuIpcCloseMemHandle(base));
 
     // Notify sender of completion
     uint32_t completion = 1;
