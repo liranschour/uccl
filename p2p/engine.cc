@@ -1638,11 +1638,48 @@ bool Endpoint::writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
                           std::vector<size_t> size_v,
                           std::vector<IpcTransferInfo> info_v,
                           size_t num_iovs) {
-  for (size_t i = 0; i < num_iovs; ++i) {
-    if (!write_ipc(conn_id, data_v[i], size_v[i], info_v[i])) {
-      return false;
-    }
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
+    std::cerr << "[writev_ipc] Error: Invalid conn_id " << conn_id << std::endl;
+    return false;
   }
+
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  auto dev_reset =
+      uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+
+  // Open all IPC handles upfront
+  std::vector<void*> raw_ptrs(num_iovs);
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_ptrs[i], info_v[i].handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+  }
+
+  // Issue all gpuMemcpyAsync calls, round-robin across streams
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  for (size_t i = 0; i < num_iovs; ++i) {
+    void* dst_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(raw_ptrs[i]) + info_v[i].offset);
+    bool src_is_gpu = (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
+    auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+    gpuStream_t stream = streams[i % streams.size()];
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
+  }
+
+  // Sync only the streams that were actually used
+  size_t num_used = std::min(num_iovs, streams.size());
+  for (size_t i = 0; i < num_used; ++i) {
+    GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+  }
+
+  // Close all IPC handles
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcCloseMemHandle(raw_ptrs[i]));
+  }
+
   return true;
 }
 
@@ -1650,11 +1687,48 @@ bool Endpoint::readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
                          std::vector<size_t> size_v,
                          std::vector<IpcTransferInfo> info_v,
                          size_t num_iovs) {
-  for (size_t i = 0; i < num_iovs; ++i) {
-    if (!read_ipc(conn_id, data_v[i], size_v[i], info_v[i])) {
-      return false;
-    }
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
+    std::cerr << "[readv_ipc] Error: Invalid conn_id " << conn_id << std::endl;
+    return false;
   }
+
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  auto dev_reset =
+      uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+
+  // Open all IPC handles upfront
+  std::vector<void*> raw_ptrs(num_iovs);
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_ptrs[i], info_v[i].handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+  }
+
+  // Issue all gpuMemcpyAsync calls, round-robin across streams
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  for (size_t i = 0; i < num_iovs; ++i) {
+    void* src_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(raw_ptrs[i]) + info_v[i].offset);
+    bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
+    auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+    gpuStream_t stream = streams[i % streams.size()];
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
+  }
+
+  // Sync only the streams that were actually used
+  size_t num_used = std::min(num_iovs, streams.size());
+  for (size_t i = 0; i < num_used; ++i) {
+    GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+  }
+
+  // Close all IPC handles
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcCloseMemHandle(raw_ptrs[i]));
+  }
+
   return true;
 }
 
@@ -1663,13 +1737,29 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
                                 std::vector<size_t> size_v,
                                 std::vector<IpcTransferInfo> info_v,
                                 size_t num_iovs, uint64_t* transfer_id) {
-  uint64_t last_id = 0;
-  for (size_t i = 0; i < num_iovs; ++i) {
-    if (!write_ipc_async(conn_id, data_v[i], size_v[i], info_v[i], &last_id)) {
-      return false;
-    }
+  auto const_data_ptr =
+      std::make_shared<std::vector<void const*>>(std::move(data_v));
+  auto size_ptr = std::make_shared<std::vector<size_t>>(std::move(size_v));
+  auto ipc_info_ptr =
+      std::make_shared<std::vector<IpcTransferInfo>>(std::move(info_v));
+
+  auto task_ptr = create_writev_ipc_task(conn_id, std::move(const_data_ptr),
+                                         std::move(size_ptr),
+                                         std::move(ipc_info_ptr));
+  if (unlikely(task_ptr == nullptr)) {
+    return false;
   }
-  *transfer_id = last_id;
+
+  auto* status = new TransferStatus();
+  status->task_ptr = task_ptr;
+  task_ptr->status_ptr = status;
+  *transfer_id = reinterpret_cast<uint64_t>(status);
+
+  UnifiedTask* task_raw = task_ptr.get();
+  while (jring_mp_enqueue_bulk(send_unified_task_ring_, &task_raw, 1,
+                               nullptr) != 1) {
+  }
+
   return true;
 }
 
@@ -1677,13 +1767,28 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
                                std::vector<size_t> size_v,
                                std::vector<IpcTransferInfo> info_v,
                                size_t num_iovs, uint64_t* transfer_id) {
-  uint64_t last_id = 0;
-  for (size_t i = 0; i < num_iovs; ++i) {
-    if (!read_ipc_async(conn_id, data_v[i], size_v[i], info_v[i], &last_id)) {
-      return false;
-    }
+  auto data_ptr = std::make_shared<std::vector<void*>>(std::move(data_v));
+  auto size_ptr = std::make_shared<std::vector<size_t>>(std::move(size_v));
+  auto ipc_info_ptr =
+      std::make_shared<std::vector<IpcTransferInfo>>(std::move(info_v));
+
+  auto task_ptr = create_readv_ipc_task(conn_id, std::move(data_ptr),
+                                        std::move(size_ptr),
+                                        std::move(ipc_info_ptr));
+  if (unlikely(task_ptr == nullptr)) {
+    return false;
   }
-  *transfer_id = last_id;
+
+  auto* status = new TransferStatus();
+  status->task_ptr = task_ptr;
+  task_ptr->status_ptr = status;
+  *transfer_id = reinterpret_cast<uint64_t>(status);
+
+  UnifiedTask* task_raw = task_ptr.get();
+  while (jring_mp_enqueue_bulk(recv_unified_task_ring_, &task_raw, 1,
+                               nullptr) != 1) {
+  }
+
   return true;
 }
 
@@ -1845,6 +1950,18 @@ void Endpoint::send_proxy_thread_func() {
         case TaskType::WRITE_IPC:
           write_ipc(task->conn_id, task->data, task->size, task->ipc_info());
           break;
+        case TaskType::WRITEV_IPC: {
+          TaskBatch const& batch = task->task_batch();
+          std::vector<void const*> const_data_v(
+              batch.const_data_v(), batch.const_data_v() + batch.num_iovs);
+          std::vector<size_t> size_v(batch.size_v(),
+                                     batch.size_v() + batch.num_iovs);
+          std::vector<IpcTransferInfo> info_v(batch.ipc_info_v(),
+                                              batch.ipc_info_v() + batch.num_iovs);
+          writev_ipc(task->conn_id, const_data_v, size_v, info_v,
+                     batch.num_iovs);
+          break;
+        }
         case TaskType::SEND_NET:
           send(task->conn_id, task->mr_id, task->data, task->size);
           break;
@@ -1908,6 +2025,17 @@ void Endpoint::recv_proxy_thread_func() {
         case TaskType::READ_IPC:
           read_ipc(task->conn_id, task->data, task->size, task->ipc_info());
           break;
+        case TaskType::READV_IPC: {
+          TaskBatch const& batch = task->task_batch();
+          std::vector<void*> data_v(batch.data_v(),
+                                    batch.data_v() + batch.num_iovs);
+          std::vector<size_t> size_v(batch.size_v(),
+                                     batch.size_v() + batch.num_iovs);
+          std::vector<IpcTransferInfo> info_v(batch.ipc_info_v(),
+                                              batch.ipc_info_v() + batch.num_iovs);
+          readv_ipc(task->conn_id, data_v, size_v, info_v, batch.num_iovs);
+          break;
+        }
         case TaskType::RECV_NET:
           recv(task->conn_id, task->mr_id, task->data, task->size);
           break;

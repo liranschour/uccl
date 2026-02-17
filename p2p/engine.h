@@ -409,6 +409,8 @@ class Endpoint {
     RECVV,
     WRITEV,
     READV,
+    WRITEV_IPC,
+    READV_IPC,
   };
   struct TaskBatch {
     size_t num_iovs;  // Number of IO vectors
@@ -417,6 +419,8 @@ class Endpoint {
     std::shared_ptr<std::vector<size_t>> size_ptr;
     std::shared_ptr<std::vector<uint64_t>> mr_id_ptr;
     std::shared_ptr<std::vector<FifoItem>> slot_item_ptr;  // for READV/WRITEV
+    std::shared_ptr<std::vector<IpcTransferInfo>>
+        ipc_info_ptr;  // for WRITEV_IPC/READV_IPC
 
     TaskBatch() : num_iovs(0) {}
 
@@ -426,7 +430,8 @@ class Endpoint {
           data_ptr(std::move(other.data_ptr)),
           size_ptr(std::move(other.size_ptr)),
           mr_id_ptr(std::move(other.mr_id_ptr)),
-          slot_item_ptr(std::move(other.slot_item_ptr)) {}
+          slot_item_ptr(std::move(other.slot_item_ptr)),
+          ipc_info_ptr(std::move(other.ipc_info_ptr)) {}
 
     TaskBatch& operator=(TaskBatch&& other) noexcept {
       if (this != &other) {
@@ -436,6 +441,7 @@ class Endpoint {
         size_ptr = std::move(other.size_ptr);
         mr_id_ptr = std::move(other.mr_id_ptr);
         slot_item_ptr = std::move(other.slot_item_ptr);
+        ipc_info_ptr = std::move(other.ipc_info_ptr);
       }
       return *this;
     }
@@ -462,6 +468,10 @@ class Endpoint {
     FifoItem* slot_item_v() const {
       if (!slot_item_ptr) return nullptr;
       return slot_item_ptr->data();
+    }
+    IpcTransferInfo* ipc_info_v() const {
+      if (!ipc_info_ptr) return nullptr;
+      return ipc_info_ptr->data();
     }
   };
 
@@ -567,7 +577,8 @@ class Endpoint {
 
     inline bool is_batch_task() const {
       return type == TaskType::SENDV || type == TaskType::RECVV ||
-             type == TaskType::WRITEV || type == TaskType::READV;
+             type == TaskType::WRITEV || type == TaskType::READV ||
+             type == TaskType::WRITEV_IPC || type == TaskType::READV_IPC;
     }
   };
 
@@ -693,6 +704,47 @@ class Endpoint {
     batch.slot_item_ptr = std::move(slot_item_ptr);
 
     return create_batch_task(conn_id, TaskType::READV, std::move(batch));
+  }
+
+  inline std::shared_ptr<UnifiedTask> create_writev_ipc_task(
+      uint64_t conn_id,
+      std::shared_ptr<std::vector<void const*>> const_data_ptr,
+      std::shared_ptr<std::vector<size_t>> size_ptr,
+      std::shared_ptr<std::vector<IpcTransferInfo>> ipc_info_ptr) {
+    if (!const_data_ptr || !size_ptr || !ipc_info_ptr ||
+        const_data_ptr->size() != size_ptr->size() ||
+        size_ptr->size() != ipc_info_ptr->size()) {
+      return nullptr;
+    }
+    size_t num_iovs = const_data_ptr->size();
+
+    TaskBatch batch;
+    batch.num_iovs = num_iovs;
+    batch.const_data_ptr = std::move(const_data_ptr);
+    batch.size_ptr = std::move(size_ptr);
+    batch.ipc_info_ptr = std::move(ipc_info_ptr);
+
+    return create_batch_task(conn_id, TaskType::WRITEV_IPC, std::move(batch));
+  }
+
+  inline std::shared_ptr<UnifiedTask> create_readv_ipc_task(
+      uint64_t conn_id, std::shared_ptr<std::vector<void*>> data_ptr,
+      std::shared_ptr<std::vector<size_t>> size_ptr,
+      std::shared_ptr<std::vector<IpcTransferInfo>> ipc_info_ptr) {
+    if (!data_ptr || !size_ptr || !ipc_info_ptr ||
+        data_ptr->size() != size_ptr->size() ||
+        size_ptr->size() != ipc_info_ptr->size()) {
+      return nullptr;
+    }
+    size_t num_iovs = data_ptr->size();
+
+    TaskBatch batch;
+    batch.num_iovs = num_iovs;
+    batch.data_ptr = std::move(data_ptr);
+    batch.size_ptr = std::move(size_ptr);
+    batch.ipc_info_ptr = std::move(ipc_info_ptr);
+
+    return create_batch_task(conn_id, TaskType::READV_IPC, std::move(batch));
   }
 
   inline std::shared_ptr<UnifiedTask> create_net_task(
