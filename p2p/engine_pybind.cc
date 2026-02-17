@@ -764,6 +764,146 @@ PYBIND11_MODULE(p2p, m) {
           "Read data asynchronously via one-sided IPC using IpcTransferInfo",
           py::arg("conn_id"), py::arg("ptr"), py::arg("size"), py::arg("info"))
       .def(
+          "writev_ipc",
+          [](Endpoint& self, uint64_t conn_id, std::vector<uint64_t> ptr_v,
+             std::vector<size_t> size_v, py::list info_blob_v,
+             size_t num_iovs) {
+            if (ptr_v.size() != num_iovs || size_v.size() != num_iovs ||
+                py::len(info_blob_v) != num_iovs) {
+              throw std::runtime_error(
+                  "All input vectors/lists must have length num_iovs");
+            }
+            std::vector<void const*> data_v;
+            std::vector<Endpoint::IpcTransferInfo> info_v;
+            data_v.reserve(num_iovs);
+            info_v.reserve(num_iovs);
+            for (size_t i = 0; i < num_iovs; ++i) {
+              data_v.push_back(reinterpret_cast<void const*>(ptr_v[i]));
+              std::string buf = py::cast<py::bytes>(info_blob_v[i]);
+              CHECK_EQ(buf.size(), sizeof(Endpoint::IpcTransferInfo))
+                  << "IpcTransferInfo size mismatch";
+              Endpoint::IpcTransferInfo info;
+              std::memcpy(&info, buf.data(), sizeof(info));
+              info_v.push_back(info);
+            }
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.writev_ipc(conn_id, data_v, size_v, info_v, num_iovs);
+            }
+            return ok;
+          },
+          "Write multiple buffers via one-sided IPC",
+          py::arg("conn_id"), py::arg("ptr_v"), py::arg("size_v"),
+          py::arg("info_blob_v"), py::arg("num_iovs"))
+      .def(
+          "readv_ipc",
+          [](Endpoint& self, uint64_t conn_id, std::vector<uint64_t> ptr_v,
+             std::vector<size_t> size_v, py::list info_blob_v,
+             size_t num_iovs) {
+            if (ptr_v.size() != num_iovs || size_v.size() != num_iovs ||
+                py::len(info_blob_v) != num_iovs) {
+              throw std::runtime_error(
+                  "All input vectors/lists must have length num_iovs");
+            }
+            std::vector<void*> data_v;
+            std::vector<Endpoint::IpcTransferInfo> info_v;
+            data_v.reserve(num_iovs);
+            info_v.reserve(num_iovs);
+            for (size_t i = 0; i < num_iovs; ++i) {
+              data_v.push_back(reinterpret_cast<void*>(ptr_v[i]));
+              std::string buf = py::cast<py::bytes>(info_blob_v[i]);
+              CHECK_EQ(buf.size(), sizeof(Endpoint::IpcTransferInfo))
+                  << "IpcTransferInfo size mismatch";
+              Endpoint::IpcTransferInfo info;
+              std::memcpy(&info, buf.data(), sizeof(info));
+              info_v.push_back(info);
+            }
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.readv_ipc(conn_id, data_v, size_v, info_v, num_iovs);
+            }
+            return ok;
+          },
+          "Read multiple buffers via one-sided IPC",
+          py::arg("conn_id"), py::arg("ptr_v"), py::arg("size_v"),
+          py::arg("info_blob_v"), py::arg("num_iovs"))
+      .def(
+          "writev_ipc_async",
+          [](Endpoint& self, uint64_t conn_id, std::vector<uint64_t> ptr_v,
+             std::vector<size_t> size_v, py::list info_blob_v,
+             size_t num_iovs) {
+            if (ptr_v.size() != num_iovs || size_v.size() != num_iovs ||
+                py::len(info_blob_v) != num_iovs) {
+              throw std::runtime_error(
+                  "All input vectors/lists must have length num_iovs");
+            }
+            std::vector<void const*> data_v;
+            std::vector<Endpoint::IpcTransferInfo> info_v;
+            data_v.reserve(num_iovs);
+            info_v.reserve(num_iovs);
+            for (size_t i = 0; i < num_iovs; ++i) {
+              data_v.push_back(reinterpret_cast<void const*>(ptr_v[i]));
+              std::string buf = py::cast<py::bytes>(info_blob_v[i]);
+              CHECK_EQ(buf.size(), sizeof(Endpoint::IpcTransferInfo))
+                  << "IpcTransferInfo size mismatch";
+              Endpoint::IpcTransferInfo info;
+              std::memcpy(&info, buf.data(), sizeof(info));
+              info_v.push_back(info);
+            }
+            uint64_t transfer_id;
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.writev_ipc_async(conn_id, data_v, size_v, info_v,
+                                         num_iovs, &transfer_id);
+            }
+            return py::make_tuple(ok, transfer_id);
+          },
+          "Write multiple buffers asynchronously via one-sided IPC",
+          py::arg("conn_id"), py::arg("ptr_v"), py::arg("size_v"),
+          py::arg("info_blob_v"), py::arg("num_iovs"))
+      .def(
+          "readv_ipc_async",
+          [](Endpoint& self, uint64_t conn_id, std::vector<uint64_t> ptr_v,
+             std::vector<size_t> size_v, py::list info_blob_v,
+             size_t num_iovs) {
+            if (ptr_v.size() != num_iovs || size_v.size() != num_iovs ||
+                py::len(info_blob_v) != num_iovs) {
+              throw std::runtime_error(
+                  "All input vectors/lists must have length num_iovs");
+            }
+            std::vector<void*> data_v;
+            std::vector<Endpoint::IpcTransferInfo> info_v;
+            data_v.reserve(num_iovs);
+            info_v.reserve(num_iovs);
+            for (size_t i = 0; i < num_iovs; ++i) {
+              data_v.push_back(reinterpret_cast<void*>(ptr_v[i]));
+              std::string buf = py::cast<py::bytes>(info_blob_v[i]);
+              CHECK_EQ(buf.size(), sizeof(Endpoint::IpcTransferInfo))
+                  << "IpcTransferInfo size mismatch";
+              Endpoint::IpcTransferInfo info;
+              std::memcpy(&info, buf.data(), sizeof(info));
+              info_v.push_back(info);
+            }
+            uint64_t transfer_id;
+            bool ok;
+            {
+              py::gil_scoped_release release;
+              InsidePythonGuard guard;
+              ok = self.readv_ipc_async(conn_id, data_v, size_v, info_v,
+                                        num_iovs, &transfer_id);
+            }
+            return py::make_tuple(ok, transfer_id);
+          },
+          "Read multiple buffers asynchronously via one-sided IPC",
+          py::arg("conn_id"), py::arg("ptr_v"), py::arg("size_v"),
+          py::arg("info_blob_v"), py::arg("num_iovs"))
+      .def(
           "advertise_ipc",
           [](Endpoint& self, uint64_t conn_id, uint64_t ptr, size_t size) {
             char serialized[sizeof(Endpoint::IpcTransferInfo)]{};

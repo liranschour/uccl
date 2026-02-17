@@ -272,6 +272,22 @@ class Endpoint {
                        IpcTransferInfo const& info, uint64_t* transfer_id);
   bool read_ipc_async(uint64_t conn_id, void* data, size_t size,
                       IpcTransferInfo const& info, uint64_t* transfer_id);
+
+  bool writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
+                  std::vector<size_t> size_v,
+                  std::vector<IpcTransferInfo> info_v, size_t num_iovs);
+  bool readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
+                 std::vector<size_t> size_v,
+                 std::vector<IpcTransferInfo> info_v, size_t num_iovs);
+  bool writev_ipc_async(uint64_t conn_id, std::vector<void const*> data_v,
+                        std::vector<size_t> size_v,
+                        std::vector<IpcTransferInfo> info_v, size_t num_iovs,
+                        uint64_t* transfer_id);
+  bool readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
+                       std::vector<size_t> size_v,
+                       std::vector<IpcTransferInfo> info_v, size_t num_iovs,
+                       uint64_t* transfer_id);
+
   bool advertise_ipc(uint64_t conn_id, void* addr, size_t len, char* out_buf);
   bool advertisev_ipc(uint64_t conn_id, std::vector<void*> addr_v,
                       std::vector<size_t> len_v, std::vector<char*> out_buf_v,

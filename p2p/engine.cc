@@ -1634,6 +1634,59 @@ bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
   return true;
 }
 
+bool Endpoint::writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
+                          std::vector<size_t> size_v,
+                          std::vector<IpcTransferInfo> info_v,
+                          size_t num_iovs) {
+  for (size_t i = 0; i < num_iovs; ++i) {
+    if (!write_ipc(conn_id, data_v[i], size_v[i], info_v[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Endpoint::readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
+                         std::vector<size_t> size_v,
+                         std::vector<IpcTransferInfo> info_v,
+                         size_t num_iovs) {
+  for (size_t i = 0; i < num_iovs; ++i) {
+    if (!read_ipc(conn_id, data_v[i], size_v[i], info_v[i])) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool Endpoint::writev_ipc_async(uint64_t conn_id,
+                                std::vector<void const*> data_v,
+                                std::vector<size_t> size_v,
+                                std::vector<IpcTransferInfo> info_v,
+                                size_t num_iovs, uint64_t* transfer_id) {
+  uint64_t last_id = 0;
+  for (size_t i = 0; i < num_iovs; ++i) {
+    if (!write_ipc_async(conn_id, data_v[i], size_v[i], info_v[i], &last_id)) {
+      return false;
+    }
+  }
+  *transfer_id = last_id;
+  return true;
+}
+
+bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
+                               std::vector<size_t> size_v,
+                               std::vector<IpcTransferInfo> info_v,
+                               size_t num_iovs, uint64_t* transfer_id) {
+  uint64_t last_id = 0;
+  for (size_t i = 0; i < num_iovs; ++i) {
+    if (!read_ipc_async(conn_id, data_v[i], size_v[i], info_v[i], &last_id)) {
+      return false;
+    }
+  }
+  *transfer_id = last_id;
+  return true;
+}
+
 bool Endpoint::advertise_ipc(uint64_t conn_id, void* addr, size_t len,
                              char* out_buf) {
   CHECK(addr != nullptr) << "advertise_ipc: addr pointer is null!";
