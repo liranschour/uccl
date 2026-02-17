@@ -91,7 +91,7 @@ Notes:
 * To benchmark intra-node transfer via CUDA/HIP IPC, `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc`.
 * To benchmark one-sided IPC write (initiator→target GPU): `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc-onesided`.
 * To benchmark one-sided IPC read (target GPU→initiator): `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc-onesided --ipc-direction read`.
-* To benchmark one-sided IPC with CPU initiator buffer: add `--device cpu` to the above commands.
+* To benchmark one-sided IPC with CPU initiator buffer: add `--device cpu` to the above commands. Add `--pinned` to use pinned (page-locked) CPU memory, which achieves much higher throughput by enabling direct DMA transfers over PCIe without intermediate staging copies.
 * To benchmark one-sided READ/WRITE transfer, `benchmark_uccl_readwrite.py`.
 * To benchmark UCCL copy-only collectives (eg, sendrecv, allgather), `benchmark_uccl_collective.py`. You can also run ring-like communication pattern with `--ring`.
 * From CollectiveContext, the default parameter `use_copy_engine_for_intra` is `False`, which means it will use NCCL/RCCL via `torch.distributed` for intra-node communication; if setting to `True`, it will use GPU copy engine (eg, `cudaMemcpy`) via UCCL for intranode communication. 
