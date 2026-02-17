@@ -74,8 +74,13 @@ Endpoint::Endpoint(uint32_t const local_gpu_idx, uint32_t const num_cpus)
   recv_unified_task_ring_ =
       uccl::create_ring(sizeof(UnifiedTask*), kTaskRingSize);
 
+  ipc_completion_ring_ =
+      uccl::create_ring(sizeof(PendingIpcBatch*), kTaskRingSize);
+
   send_proxy_thread_ = std::thread(&Endpoint::send_proxy_thread_func, this);
   recv_proxy_thread_ = std::thread(&Endpoint::recv_proxy_thread_func, this);
+  ipc_completion_thread_ =
+      std::thread(&Endpoint::ipc_completion_thread_func, this);
 
   // Initialize UDS socket for local connections
   init_uds_socket();
@@ -121,12 +126,18 @@ Endpoint::~Endpoint() {
   if (recv_proxy_thread_.joinable()) {
     recv_proxy_thread_.join();
   }
+  if (ipc_completion_thread_.joinable()) {
+    ipc_completion_thread_.join();
+  }
 
   if (send_unified_task_ring_ != nullptr) {
     free(send_unified_task_ring_);
   }
   if (recv_unified_task_ring_ != nullptr) {
     free(recv_unified_task_ring_);
+  }
+  if (ipc_completion_ring_ != nullptr) {
+    free(ipc_completion_ring_);
   }
 
   {
@@ -179,8 +190,13 @@ void Endpoint::initialize_engine() {
   recv_unified_task_ring_ =
       uccl::create_ring(sizeof(UnifiedTask*), kTaskRingSize);
 
+  ipc_completion_ring_ =
+      uccl::create_ring(sizeof(PendingIpcBatch*), kTaskRingSize);
+
   send_proxy_thread_ = std::thread(&Endpoint::send_proxy_thread_func, this);
   recv_proxy_thread_ = std::thread(&Endpoint::recv_proxy_thread_func, this);
+  ipc_completion_thread_ =
+      std::thread(&Endpoint::ipc_completion_thread_func, this);
 
   // Initialize UDS socket for local connections
   init_uds_socket();
@@ -1928,6 +1944,48 @@ void Endpoint::cleanup_uds_socket() {
   }
 }
 
+void Endpoint::ipc_completion_thread_func() {
+  std::vector<PendingIpcBatch*> active;
+  alignas(16) char buf[16];
+
+  while (!stop_.load(std::memory_order_acquire)) {
+    // Drain ring into active list
+    while (jring_sc_dequeue_bulk(ipc_completion_ring_, buf, 1, nullptr) == 1) {
+      active.push_back(*reinterpret_cast<PendingIpcBatch**>(buf));
+    }
+
+    // Poll each batch for completion
+    for (auto it = active.begin(); it != active.end();) {
+      bool all_done = true;
+      for (auto& evt : (*it)->events) {
+        if (gpuEventQuery(evt) != gpuSuccess) {
+          all_done = false;
+          break;
+        }
+      }
+      if (all_done) {
+        for (auto& evt : (*it)->events) {
+          GPU_RT_CHECK(gpuEventDestroy(evt));
+        }
+        GPU_RT_CHECK(gpuSetDevice((*it)->orig_device));
+        for (auto& ptr : (*it)->raw_ptrs) {
+          GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
+        }
+        (*it)->task->status_ptr->done.store(true, std::memory_order_release);
+        (*it)->task->status_ptr->task_ptr.reset();
+        delete *it;
+        it = active.erase(it);
+      } else {
+        ++it;
+      }
+    }
+
+    if (active.empty()) {
+      std::this_thread::yield();
+    }
+  }
+}
+
 void Endpoint::send_proxy_thread_func() {
   uccl::pin_thread_to_numa(numa_node_);
   // Use 16-byte buffer to avoid stringop-overflow warning from jring's 16-byte
@@ -1951,15 +2009,64 @@ void Endpoint::send_proxy_thread_func() {
           write_ipc(task->conn_id, task->data, task->size, task->ipc_info());
           break;
         case TaskType::WRITEV_IPC: {
+          // Launch async: open handles, issue copies, record events
           TaskBatch const& batch = task->task_batch();
-          std::vector<void const*> const_data_v(
-              batch.const_data_v(), batch.const_data_v() + batch.num_iovs);
-          std::vector<size_t> size_v(batch.size_v(),
-                                     batch.size_v() + batch.num_iovs);
-          std::vector<IpcTransferInfo> info_v(batch.ipc_info_v(),
-                                              batch.ipc_info_v() + batch.num_iovs);
-          writev_ipc(task->conn_id, const_data_v, size_v, info_v,
-                     batch.num_iovs);
+          size_t num_iovs = batch.num_iovs;
+          void const** data_v = batch.const_data_v();
+          size_t* size_v = batch.size_v();
+          IpcTransferInfo* info_v = batch.ipc_info_v();
+
+          Conn* conn = get_conn(task->conn_id);
+          if (unlikely(conn == nullptr)) {
+            task->status_ptr->done.store(true, std::memory_order_release);
+            task->status_ptr->task_ptr.reset();
+            break;
+          }
+
+          auto* pending = new PendingIpcBatch();
+          pending->task = task;
+          GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+          GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+
+          // Open all IPC handles
+          pending->raw_ptrs.resize(num_iovs);
+          for (size_t i = 0; i < num_iovs; ++i) {
+            GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i],
+                                             info_v[i].handle,
+                                             gpuIpcMemLazyEnablePeerAccess));
+          }
+
+          // Issue all async copies round-robin across streams
+          std::vector<gpuStream_t>& streams =
+              ipc_streams_[conn->remote_gpu_idx_];
+          for (size_t i = 0; i < num_iovs; ++i) {
+            void* dst_ptr = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) +
+                info_v[i].offset);
+            bool src_is_gpu =
+                (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
+            auto kind =
+                src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+            gpuStream_t stream = streams[i % streams.size()];
+            GPU_RT_CHECK(
+                gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
+          }
+
+          // Record events on used streams
+          size_t num_used = std::min(num_iovs, streams.size());
+          pending->events.resize(num_used);
+          for (size_t i = 0; i < num_used; ++i) {
+            GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                                 gpuEventDisableTiming));
+            GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+          }
+
+          GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+          // Hand off to completion thread via lock-free ring
+          while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
+                                       nullptr) != 1) {
+          }
           break;
         }
         case TaskType::SEND_NET:
@@ -1997,8 +2104,11 @@ void Endpoint::send_proxy_thread_func() {
                      << static_cast<int>(task->type);
           break;
       }
-      task->status_ptr->done.store(true, std::memory_order_release);
-      task->status_ptr->task_ptr.reset();
+      // Mark done immediately for non-IPC-batch tasks
+      if (task->type != TaskType::WRITEV_IPC) {
+        task->status_ptr->done.store(true, std::memory_order_release);
+        task->status_ptr->task_ptr.reset();
+      }
     }
   }
 }
@@ -2026,14 +2136,63 @@ void Endpoint::recv_proxy_thread_func() {
           read_ipc(task->conn_id, task->data, task->size, task->ipc_info());
           break;
         case TaskType::READV_IPC: {
+          // Launch async: open handles, issue copies, record events
           TaskBatch const& batch = task->task_batch();
-          std::vector<void*> data_v(batch.data_v(),
-                                    batch.data_v() + batch.num_iovs);
-          std::vector<size_t> size_v(batch.size_v(),
-                                     batch.size_v() + batch.num_iovs);
-          std::vector<IpcTransferInfo> info_v(batch.ipc_info_v(),
-                                              batch.ipc_info_v() + batch.num_iovs);
-          readv_ipc(task->conn_id, data_v, size_v, info_v, batch.num_iovs);
+          size_t num_iovs = batch.num_iovs;
+          void** data_v = batch.data_v();
+          size_t* size_v = batch.size_v();
+          IpcTransferInfo* info_v = batch.ipc_info_v();
+
+          Conn* conn = get_conn(task->conn_id);
+          if (unlikely(conn == nullptr)) {
+            task->status_ptr->done.store(true, std::memory_order_release);
+            task->status_ptr->task_ptr.reset();
+            break;
+          }
+
+          auto* pending = new PendingIpcBatch();
+          pending->task = task;
+          GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+          GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
+
+          // Open all IPC handles
+          pending->raw_ptrs.resize(num_iovs);
+          for (size_t i = 0; i < num_iovs; ++i) {
+            GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i],
+                                             info_v[i].handle,
+                                             gpuIpcMemLazyEnablePeerAccess));
+          }
+
+          // Issue all async copies round-robin across streams
+          std::vector<gpuStream_t>& streams =
+              ipc_streams_[conn->remote_gpu_idx_];
+          for (size_t i = 0; i < num_iovs; ++i) {
+            void* src_ptr = reinterpret_cast<void*>(
+                reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) +
+                info_v[i].offset);
+            bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
+            auto kind =
+                dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+            gpuStream_t stream = streams[i % streams.size()];
+            GPU_RT_CHECK(
+                gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
+          }
+
+          // Record events on used streams
+          size_t num_used = std::min(num_iovs, streams.size());
+          pending->events.resize(num_used);
+          for (size_t i = 0; i < num_used; ++i) {
+            GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                                 gpuEventDisableTiming));
+            GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+          }
+
+          GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+          // Hand off to completion thread via lock-free ring
+          while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
+                                       nullptr) != 1) {
+          }
           break;
         }
         case TaskType::RECV_NET:
@@ -2075,8 +2234,11 @@ void Endpoint::recv_proxy_thread_func() {
                      << static_cast<int>(task->type);
           break;
       }
-      task->status_ptr->done.store(true, std::memory_order_release);
-      task->status_ptr->task_ptr.reset();
+      // Mark done immediately for non-IPC-batch tasks
+      if (task->type != TaskType::READV_IPC) {
+        task->status_ptr->done.store(true, std::memory_order_release);
+        task->status_ptr->task_ptr.reset();
+      }
     }
   }
 }

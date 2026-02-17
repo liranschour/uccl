@@ -767,6 +767,17 @@ class Endpoint {
   jring_t* send_unified_task_ring_ = nullptr;
   jring_t* recv_unified_task_ring_ = nullptr;
 
+  // Pending IPC batch passed from proxy threads to completion thread.
+  struct PendingIpcBatch {
+    UnifiedTask* task;
+    std::vector<void*> raw_ptrs;     // IPC handles to close on completion
+    std::vector<gpuEvent_t> events;  // Events to poll
+    int orig_device;
+  };
+  jring_t* ipc_completion_ring_ = nullptr;  // MP/SC ring of PendingIpcBatch*
+  std::thread ipc_completion_thread_;
+  void ipc_completion_thread_func();
+
   std::atomic<bool> stop_{false};
   std::thread send_proxy_thread_;
   std::thread recv_proxy_thread_;
