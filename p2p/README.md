@@ -89,6 +89,9 @@ Notes:
 * **You must first import `torch` before importing `uccl.p2p` for AMD GPUs**, otherwise, `RuntimeError: No HIP GPUs are available` will occur. We guess this is because torch does some extra init for AMD GPUs, in order for Pybind-C++ code to work. 
 * To benchmark dual direction transfer, `benchmark_uccl.py --dual`.
 * To benchmark intra-node transfer via CUDA/HIP IPC, `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc`.
+* To benchmark one-sided IPC write (initiator→target GPU): `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc-onesided`.
+* To benchmark one-sided IPC read (target GPU→initiator): `torchrun --nproc_per_node=2 benchmarks/benchmark_uccl.py --ipc-onesided --ipc-direction read`.
+* To benchmark one-sided IPC with CPU initiator buffer: add `--device cpu` to the above commands.
 * To benchmark one-sided READ/WRITE transfer, `benchmark_uccl_readwrite.py`.
 * To benchmark UCCL copy-only collectives (eg, sendrecv, allgather), `benchmark_uccl_collective.py`. You can also run ring-like communication pattern with `--ring`.
 * From CollectiveContext, the default parameter `use_copy_engine_for_intra` is `False`, which means it will use NCCL/RCCL via `torch.distributed` for intra-node communication; if setting to `True`, it will use GPU copy engine (eg, `cudaMemcpy`) via UCCL for intranode communication. 
