@@ -464,24 +464,86 @@ def _run_target_ipc_onesided(args, ep):
     ok, remote_gpu_idx, conn_id = ep.accept_local()
     assert ok, "[Target] Failed to accept local IPC connection"
 
+    num_blocks = args.num_kvblocks
+
     for size in args.sizes:
-        # Target buffer is always GPU (required by gpuIpcGetMemHandle)
-        buf, ptr = _make_buffer(size, "gpu", args.local_gpu_idx)
+        size_per_block = size // num_blocks
 
-        # Advertise buffer for one-sided access
-        ok, fifo_blob = ep.advertise_ipc(conn_id, ptr, size)
-        assert ok, "[Target] advertise_ipc failed"
+        # Allocate and advertise N GPU blocks
+        buf_v = []
+        blob_v = []
+        for _ in range(num_blocks):
+            buf, ptr = _make_buffer(size_per_block, "gpu", args.local_gpu_idx)
+            ok, fifo_blob = ep.advertise_ipc(conn_id, ptr, size_per_block)
+            assert ok, "[Target] advertise_ipc failed"
+            buf_v.append(buf)
+            blob_v.append(fifo_blob)
 
-        # Send fifo_blob to initiator
-        blob_tensor = torch.ByteTensor(list(fifo_blob))
-        dist.send(torch.IntTensor([len(fifo_blob)]), dst=0)
-        dist.send(blob_tensor, dst=0)
+        # Send number of blobs and all blobs to initiator
+        dist.send(torch.IntTensor([num_blocks]), dst=0)
+        for blob in blob_v:
+            blob_tensor = torch.ByteTensor(list(blob))
+            dist.send(torch.IntTensor([len(blob)]), dst=0)
+            dist.send(blob_tensor, dst=0)
 
         # Wait for initiator to finish
         done = torch.IntTensor([0])
         dist.recv(done, src=0)
 
     print("[Target] One-sided IPC Benchmark complete")
+
+
+def _do_ipc_onesided_op(ep, conn_id, direction, async_api, num_blocks,
+                        ptr_v, size_v, blob_v):
+    """Execute a single write_ipc or read_ipc operation (scalar or vectorized)."""
+    if num_blocks == 1:
+        if direction == "write":
+            if async_api:
+                ok, transfer_id = ep.write_ipc_async(conn_id, ptr_v[0], size_v[0], blob_v[0])
+                assert ok, "[Initiator] write_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.write_ipc(conn_id, ptr_v[0], size_v[0], blob_v[0])
+                assert ok, "[Initiator] write_ipc error"
+        else:
+            if async_api:
+                ok, transfer_id = ep.read_ipc_async(conn_id, ptr_v[0], size_v[0], blob_v[0])
+                assert ok, "[Initiator] read_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.read_ipc(conn_id, ptr_v[0], size_v[0], blob_v[0])
+                assert ok, "[Initiator] read_ipc error"
+    else:
+        if direction == "write":
+            if async_api:
+                ok, transfer_id = ep.writev_ipc_async(
+                    conn_id, ptr_v, size_v, blob_v, num_blocks)
+                assert ok, "[Initiator] writev_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.writev_ipc(conn_id, ptr_v, size_v, blob_v, num_blocks)
+                assert ok, "[Initiator] writev_ipc error"
+        else:
+            if async_api:
+                ok, transfer_id = ep.readv_ipc_async(
+                    conn_id, ptr_v, size_v, blob_v, num_blocks)
+                assert ok, "[Initiator] readv_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.readv_ipc(conn_id, ptr_v, size_v, blob_v, num_blocks)
+                assert ok, "[Initiator] readv_ipc error"
 
 
 def _run_initiator_ipc_onesided(args, ep, remote_gpu_idx):
@@ -492,65 +554,41 @@ def _run_initiator_ipc_onesided(args, ep, remote_gpu_idx):
     direction = getattr(args, "ipc_direction", "write")
 
     for size in args.sizes:
-        # Initiator buffer can be CPU or GPU (controlled by --device)
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
+        # Receive number of blocks from target
+        num_blocks_tensor = torch.IntTensor([0])
+        dist.recv(num_blocks_tensor, src=1)
+        num_blocks = num_blocks_tensor.item()
 
-        # Receive fifo_blob from target
-        blob_len = torch.IntTensor([0])
-        dist.recv(blob_len, src=1)
-        blob_tensor = torch.zeros(blob_len.item(), dtype=torch.uint8)
-        dist.recv(blob_tensor, src=1)
-        fifo_blob = bytes(blob_tensor.tolist())
+        size_per_block = size // num_blocks
+
+        # Allocate N initiator buffers
+        buf_v = []
+        ptr_v = []
+        size_v = []
+        for _ in range(num_blocks):
+            buf, ptr = _make_buffer(size_per_block, args.device, args.local_gpu_idx, args.pinned)
+            buf_v.append(buf)
+            ptr_v.append(ptr)
+            size_v.append(size_per_block)
+
+        # Receive N fifo_blobs from target
+        blob_v = []
+        for _ in range(num_blocks):
+            blob_len = torch.IntTensor([0])
+            dist.recv(blob_len, src=1)
+            blob_tensor = torch.zeros(blob_len.item(), dtype=torch.uint8)
+            dist.recv(blob_tensor, src=1)
+            blob_v.append(bytes(blob_tensor.tolist()))
 
         # Warm-up transfer
-        if direction == "write":
-            if args.async_api:
-                ok, transfer_id = ep.write_ipc_async(conn_id, ptr, size, fifo_blob)
-                assert ok, "[Initiator] write_ipc_async error"
-                is_done = False
-                while not is_done:
-                    ok, is_done = ep.poll_async(transfer_id)
-                    assert ok, "[Initiator] poll_async error"
-            else:
-                ok = ep.write_ipc(conn_id, ptr, size, fifo_blob)
-                assert ok, "[Initiator] write_ipc error"
-        else:
-            if args.async_api:
-                ok, transfer_id = ep.read_ipc_async(conn_id, ptr, size, fifo_blob)
-                assert ok, "[Initiator] read_ipc_async error"
-                is_done = False
-                while not is_done:
-                    ok, is_done = ep.poll_async(transfer_id)
-                    assert ok, "[Initiator] poll_async error"
-            else:
-                ok = ep.read_ipc(conn_id, ptr, size, fifo_blob)
-                assert ok, "[Initiator] read_ipc error"
+        _do_ipc_onesided_op(ep, conn_id, direction, args.async_api,
+                            num_blocks, ptr_v, size_v, blob_v)
 
         start = time.perf_counter()
         total_bytes = 0
         for _ in range(args.iters):
-            if direction == "write":
-                if args.async_api:
-                    ok, transfer_id = ep.write_ipc_async(conn_id, ptr, size, fifo_blob)
-                    assert ok, "[Initiator] write_ipc_async error"
-                    is_done = False
-                    while not is_done:
-                        ok, is_done = ep.poll_async(transfer_id)
-                        assert ok, "[Initiator] poll_async error"
-                else:
-                    ok = ep.write_ipc(conn_id, ptr, size, fifo_blob)
-                    assert ok, "[Initiator] write_ipc error"
-            else:
-                if args.async_api:
-                    ok, transfer_id = ep.read_ipc_async(conn_id, ptr, size, fifo_blob)
-                    assert ok, "[Initiator] read_ipc_async error"
-                    is_done = False
-                    while not is_done:
-                        ok, is_done = ep.poll_async(transfer_id)
-                        assert ok, "[Initiator] poll_async error"
-                else:
-                    ok = ep.read_ipc(conn_id, ptr, size, fifo_blob)
-                    assert ok, "[Initiator] read_ipc error"
+            _do_ipc_onesided_op(ep, conn_id, direction, args.async_api,
+                                num_blocks, ptr_v, size_v, blob_v)
             total_bytes += size
         elapsed = time.perf_counter() - start
 
@@ -565,7 +603,8 @@ def _run_initiator_ipc_onesided(args, ep, remote_gpu_idx):
         # Signal completion to target
         dist.send(torch.IntTensor([1]), dst=1)
 
-    print(f"[Initiator] One-sided IPC Benchmark ({direction}_ipc) complete")
+    api = f"{direction}v_ipc" if args.num_kvblocks > 1 else f"{direction}_ipc"
+    print(f"[Initiator] One-sided IPC Benchmark ({api}) complete")
 
 
 def parse_size_list(val: str) -> List[int]:
