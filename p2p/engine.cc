@@ -1971,10 +1971,13 @@ void Endpoint::ipc_completion_thread_func() {
         for (auto& ptr : (*it)->raw_ptrs) {
           GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
         }
-        (*it)->task->status_ptr->done.store(true, std::memory_order_release);
-        (*it)->task->status_ptr->task_ptr.reset();
+        // Store status_ptr before resetting task_ptr to avoid use-after-free
+        TransferStatus* status = (*it)->task->status_ptr;
         delete *it;
         it = active.erase(it);
+        // Reset task_ptr after deleting PendingIpcBatch to ensure task pointer is valid
+        status->task_ptr.reset();
+        status->done.store(true, std::memory_order_release);
       } else {
         ++it;
       }
