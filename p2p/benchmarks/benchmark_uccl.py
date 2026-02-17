@@ -21,7 +21,7 @@ except ImportError as exc:
 # parse_metadata is now provided by the C++ layer via p2p.Endpoint.parse_metadata()
 
 
-def _make_buffer(size_bytes: int, device: str, gpu_idx: int):
+def _make_buffer(size_bytes: int, device: str, gpu_idx: int, pinned: bool = False):
     """Allocate a contiguous buffer of *size_bytes* and return (buffer, ptr)."""
     if device == "gpu":
         dtype = torch.float32 if size_bytes >= 4 else torch.uint8
@@ -30,7 +30,13 @@ def _make_buffer(size_bytes: int, device: str, gpu_idx: int):
         assert buf.device.type == "cuda"
         assert buf.is_contiguous()
         ptr = buf.data_ptr()
-    else:  # cpu
+    elif pinned:
+        dtype = torch.float32 if size_bytes >= 4 else torch.uint8
+        n_elems = size_bytes // dtype.itemsize
+        buf = torch.ones(n_elems, dtype=dtype, pin_memory=True)
+        assert buf.is_pinned()
+        ptr = buf.data_ptr()
+    else:  # cpu unpinned
         dtype = np.float32 if size_bytes >= 4 else np.uint8
         n_elems = size_bytes // np.dtype(dtype).itemsize
         buf = np.ones(n_elems, dtype=dtype)
@@ -60,7 +66,7 @@ def _run_server(args, ep, remote_metadata):
         data_ptr_v = []
         size_v = []
         for _ in range(args.num_kvblocks):
-            buf, ptr = _make_buffer(size_per_block, args.device, args.local_gpu_idx)
+            buf, ptr = _make_buffer(size_per_block, args.device, args.local_gpu_idx, args.pinned)
             ok, mr_id = ep.reg(ptr, size_per_block)
             assert ok, "[Server] register failed"
             buf_v.append(buf)
@@ -160,7 +166,7 @@ def _run_client(args, ep, remote_metadata):
         data_ptr_v = []
         size_v = []
         for _ in range(args.num_kvblocks):
-            buf, ptr = _make_buffer(size_per_block, args.device, args.local_gpu_idx)
+            buf, ptr = _make_buffer(size_per_block, args.device, args.local_gpu_idx, args.pinned)
             ok, mr_id = ep.reg(ptr, size_per_block)
             assert ok, "[Client] register failed"
             buf_v.append(buf)
@@ -257,12 +263,12 @@ def _run_server_dual(args, ep, remote_metadata):
     print(f"[Server] Connected to {ip}:{port} (GPU {r_gpu}) conn_id={conn_id2}")
 
     for size in args.sizes:
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
         ok, mr_id = ep.reg(ptr, size)
         assert ok, "[Server] register failed"
         # ep.recv(conn_id, mr_id, ptr, size)
 
-        buf2, ptr2 = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf2, ptr2 = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
         ok, mr_id2 = ep.reg(ptr2, size)
         assert ok, "[Server] register failed"
         # ep.send(conn_id, mr_id2, ptr2, size)
@@ -314,12 +320,12 @@ def _run_client_dual(args, ep, remote_metadata):
     print(f"[Client] Accept from {r_ip} (GPU {r_gpu2}) conn_id={conn_id2}")
 
     for size in args.sizes:
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
         ok, mr_id = ep.reg(ptr, size)
         assert ok, "[Client] register failed"
         # ep.send(conn_id, mr_id, ptr, size)
 
-        buf2, ptr2 = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf2, ptr2 = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
         ok, mr_id2 = ep.reg(ptr2, size)
         assert ok, "[Client] register failed"
         # ep.recv(conn_id, mr_id2, ptr2, size)
@@ -366,7 +372,7 @@ def _run_server_ipc(args, ep):
 
     for size in args.sizes:
         # Allocate receive buffer - no memory registration needed for IPC
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
 
         # Warm-up transfer
         if args.async_api:
@@ -413,7 +419,7 @@ def _run_client_ipc(args, ep, remote_gpu_idx):
 
     for size in args.sizes:
         # Allocate send buffer - no memory registration needed for IPC
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
 
         # Warm-up transfer
         if args.async_api:
@@ -487,7 +493,7 @@ def _run_initiator_ipc_onesided(args, ep, remote_gpu_idx):
 
     for size in args.sizes:
         # Initiator buffer can be CPU or GPU (controlled by --device)
-        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx, args.pinned)
 
         # Receive fifo_blob from target
         blob_len = torch.IntTensor([0])
@@ -583,6 +589,11 @@ def main():
         choices=["cpu", "gpu"],
         default="gpu",
         help="Buffer location (cpu or gpu)",
+    )
+    p.add_argument(
+        "--pinned",
+        action="store_true",
+        help="Use pinned (page-locked) CPU memory for faster DMA transfers",
     )
     p.add_argument(
         "--sizes",
