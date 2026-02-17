@@ -453,6 +453,115 @@ def _run_client_ipc(args, ep, remote_gpu_idx):
     print("[Client] IPC Benchmark complete")
 
 
+def _run_target_ipc_onesided(args, ep):
+    """Target for one-sided IPC benchmark - exposes GPU buffer via advertise_ipc"""
+    ok, remote_gpu_idx, conn_id = ep.accept_local()
+    assert ok, "[Target] Failed to accept local IPC connection"
+
+    for size in args.sizes:
+        # Target buffer is always GPU (required by gpuIpcGetMemHandle)
+        buf, ptr = _make_buffer(size, "gpu", args.local_gpu_idx)
+
+        # Advertise buffer for one-sided access
+        ok, fifo_blob = ep.advertise_ipc(conn_id, ptr, size)
+        assert ok, "[Target] advertise_ipc failed"
+
+        # Send fifo_blob to initiator
+        blob_tensor = torch.ByteTensor(list(fifo_blob))
+        dist.send(torch.IntTensor([len(fifo_blob)]), dst=0)
+        dist.send(blob_tensor, dst=0)
+
+        # Wait for initiator to finish
+        done = torch.IntTensor([0])
+        dist.recv(done, src=0)
+
+    print("[Target] One-sided IPC Benchmark complete")
+
+
+def _run_initiator_ipc_onesided(args, ep, remote_gpu_idx):
+    """Initiator for one-sided IPC benchmark - performs write_ipc or read_ipc"""
+    ok, conn_id = ep.connect_local(remote_gpu_idx)
+    assert ok, "[Initiator] Failed to connect to local target via IPC"
+
+    direction = getattr(args, "ipc_direction", "write")
+
+    for size in args.sizes:
+        # Initiator buffer can be CPU or GPU (controlled by --device)
+        buf, ptr = _make_buffer(size, args.device, args.local_gpu_idx)
+
+        # Receive fifo_blob from target
+        blob_len = torch.IntTensor([0])
+        dist.recv(blob_len, src=1)
+        blob_tensor = torch.zeros(blob_len.item(), dtype=torch.uint8)
+        dist.recv(blob_tensor, src=1)
+        fifo_blob = bytes(blob_tensor.tolist())
+
+        # Warm-up transfer
+        if direction == "write":
+            if args.async_api:
+                ok, transfer_id = ep.write_ipc_async(conn_id, ptr, size, fifo_blob)
+                assert ok, "[Initiator] write_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.write_ipc(conn_id, ptr, size, fifo_blob)
+                assert ok, "[Initiator] write_ipc error"
+        else:
+            if args.async_api:
+                ok, transfer_id = ep.read_ipc_async(conn_id, ptr, size, fifo_blob)
+                assert ok, "[Initiator] read_ipc_async error"
+                is_done = False
+                while not is_done:
+                    ok, is_done = ep.poll_async(transfer_id)
+                    assert ok, "[Initiator] poll_async error"
+            else:
+                ok = ep.read_ipc(conn_id, ptr, size, fifo_blob)
+                assert ok, "[Initiator] read_ipc error"
+
+        start = time.perf_counter()
+        total_bytes = 0
+        for _ in range(args.iters):
+            if direction == "write":
+                if args.async_api:
+                    ok, transfer_id = ep.write_ipc_async(conn_id, ptr, size, fifo_blob)
+                    assert ok, "[Initiator] write_ipc_async error"
+                    is_done = False
+                    while not is_done:
+                        ok, is_done = ep.poll_async(transfer_id)
+                        assert ok, "[Initiator] poll_async error"
+                else:
+                    ok = ep.write_ipc(conn_id, ptr, size, fifo_blob)
+                    assert ok, "[Initiator] write_ipc error"
+            else:
+                if args.async_api:
+                    ok, transfer_id = ep.read_ipc_async(conn_id, ptr, size, fifo_blob)
+                    assert ok, "[Initiator] read_ipc_async error"
+                    is_done = False
+                    while not is_done:
+                        ok, is_done = ep.poll_async(transfer_id)
+                        assert ok, "[Initiator] poll_async error"
+                else:
+                    ok = ep.read_ipc(conn_id, ptr, size, fifo_blob)
+                    assert ok, "[Initiator] read_ipc error"
+            total_bytes += size
+        elapsed = time.perf_counter() - start
+
+        gbps = (total_bytes * 8) / elapsed / 1e9
+        gb_sec = total_bytes / elapsed / 1e9
+        lat = elapsed / args.iters if args.iters > 0 else 0
+
+        print(
+            f"[Initiator] {_pretty_size(size):>8} : {gbps:6.2f} Gbps | {gb_sec:6.2f} GB/s  | {lat:6.6f} s"
+        )
+
+        # Signal completion to target
+        dist.send(torch.IntTensor([1]), dst=1)
+
+    print(f"[Initiator] One-sided IPC Benchmark ({direction}_ipc) complete")
+
+
 def parse_size_list(val: str) -> List[int]:
     try:
         return [int(s) for s in val.split(",") if s]
@@ -519,11 +628,23 @@ def main():
         action="store_true",
         help="Run IPC benchmark using Unix Domain Sockets and CUDA/HIP memory handles",
     )
+    p.add_argument(
+        "--ipc-onesided",
+        action="store_true",
+        help="Run one-sided IPC benchmark using write_ipc/read_ipc",
+    )
+    p.add_argument(
+        "--ipc-direction",
+        choices=["write", "read"],
+        default="write",
+        help="Direction for one-sided IPC: write (initiator→target) or read (target→initiator)",
+    )
     args = p.parse_args()
 
     # Check for incompatible options
-    if args.dual and args.ipc:
-        print("Error: --dual and --ipc options are incompatible")
+    exclusive_modes = sum([args.dual, args.ipc, args.ipc_onesided])
+    if exclusive_modes > 1:
+        print("Error: --dual, --ipc, and --ipc-onesided are mutually exclusive")
         sys.exit(1)
 
     dist.init_process_group(backend="gloo")
@@ -531,18 +652,25 @@ def main():
     world_size = dist.get_world_size()
     assert world_size == 2, "This benchmark only supports 2 processes"
 
-    mode = "IPC" if args.ipc else ("Dual" if args.dual else "Standard")
+    if args.ipc_onesided:
+        mode = f"IPC-OneSided ({args.ipc_direction})"
+    elif args.ipc:
+        mode = "IPC"
+    elif args.dual:
+        mode = "Dual"
+    else:
+        mode = "Standard"
     api_type = "Async" if args.async_api else "Sync"
     print(
         f"UCCL P2P Benchmark — mode: {mode} | API: {api_type} | role:",
-        "client" if rank == 0 else "server",
+        "initiator" if rank == 0 else "target" if args.ipc_onesided else ("client" if rank == 0 else "server"),
     )
-    if not args.ipc:
-        print("Number of key-value blocks per message:", args.num_kvblocks)
-    else:
+    if args.ipc or args.ipc_onesided:
         # Use the rank as the local GPU index for IPC
         print(f"Using rank {rank} as local GPU index for IPC")
         args.local_gpu_idx = rank
+    else:
+        print("Number of key-value blocks per message:", args.num_kvblocks)
 
     print("Message sizes:", ", ".join(_pretty_size(s) for s in args.sizes))
     print(
@@ -570,6 +698,12 @@ def main():
             _run_client_dual(args, ep, remote_metadata)
         else:
             _run_server_dual(args, ep, remote_metadata)
+    elif args.ipc_onesided:
+        _, _, remote_gpu_idx = p2p.Endpoint.parse_metadata(remote_metadata)
+        if rank == 0:
+            _run_initiator_ipc_onesided(args, ep, remote_gpu_idx)
+        else:
+            _run_target_ipc_onesided(args, ep)
     elif args.ipc:
         _, _, remote_gpu_idx = p2p.Endpoint.parse_metadata(remote_metadata)
         if rank == 0:
