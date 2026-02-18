@@ -1738,34 +1738,39 @@ bool Endpoint::writev_ipc(uint64_t conn_id, std::vector<void const*> data_v,
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  // Open all IPC handles upfront
-  std::vector<void*> raw_ptrs(num_iovs);
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_ptrs[i], info_v[i].handle,
-                                     gpuIpcMemLazyEnablePeerAccess));
-  }
-
-  // Issue all gpuMemcpyAsync calls, round-robin across streams
   std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
-  for (size_t i = 0; i < num_iovs; ++i) {
-    void* dst_ptr = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(raw_ptrs[i]) + info_v[i].offset);
-    bool src_is_gpu = (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
-    auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
-    gpuStream_t stream = streams[i % streams.size()];
-    GPU_RT_CHECK(
-        gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
-  }
 
-  // Sync only the streams that were actually used
-  size_t num_used = std::min(num_iovs, streams.size());
-  for (size_t i = 0; i < num_used; ++i) {
-    GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
-  }
+  // Process in batches to stay within CUDA IPC handle limit
+  for (size_t start = 0; start < num_iovs; start += kMaxOpenIpcHandles) {
+    size_t end = std::min(start + kMaxOpenIpcHandles, num_iovs);
+    size_t batch_size = end - start;
 
-  // Close all IPC handles
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcCloseMemHandle(raw_ptrs[i]));
+    std::vector<void*> batch_ptrs(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      GPU_RT_CHECK(gpuIpcOpenMemHandle(&batch_ptrs[i],
+                                       info_v[start + i].handle,
+                                       gpuIpcMemLazyEnablePeerAccess));
+    }
+
+    for (size_t i = 0; i < batch_size; ++i) {
+      void* dst_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(batch_ptrs[i]) +
+          info_v[start + i].offset);
+      bool src_is_gpu =
+          (uccl::get_dev_idx(const_cast<void*>(data_v[start + i])) >= 0);
+      auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+      gpuStream_t stream = streams[(start + i) % streams.size()];
+      GPU_RT_CHECK(gpuMemcpyAsync(dst_ptr, data_v[start + i],
+                                   size_v[start + i], kind, stream));
+    }
+
+    size_t num_used = std::min(batch_size, streams.size());
+    for (size_t i = 0; i < num_used; ++i) {
+      GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+    }
+    for (auto& ptr : batch_ptrs) {
+      GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
+    }
   }
 
   return true;
@@ -1787,34 +1792,38 @@ bool Endpoint::readv_ipc(uint64_t conn_id, std::vector<void*> data_v,
       uccl::finally([&]() { GPU_RT_CHECK(gpuSetDevice(orig_device)); });
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  // Open all IPC handles upfront
-  std::vector<void*> raw_ptrs(num_iovs);
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_ptrs[i], info_v[i].handle,
-                                     gpuIpcMemLazyEnablePeerAccess));
-  }
-
-  // Issue all gpuMemcpyAsync calls, round-robin across streams
   std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
-  for (size_t i = 0; i < num_iovs; ++i) {
-    void* src_ptr = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(raw_ptrs[i]) + info_v[i].offset);
-    bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
-    auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
-    gpuStream_t stream = streams[i % streams.size()];
-    GPU_RT_CHECK(
-        gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
-  }
 
-  // Sync only the streams that were actually used
-  size_t num_used = std::min(num_iovs, streams.size());
-  for (size_t i = 0; i < num_used; ++i) {
-    GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
-  }
+  // Process in batches to stay within CUDA IPC handle limit
+  for (size_t start = 0; start < num_iovs; start += kMaxOpenIpcHandles) {
+    size_t end = std::min(start + kMaxOpenIpcHandles, num_iovs);
+    size_t batch_size = end - start;
 
-  // Close all IPC handles
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcCloseMemHandle(raw_ptrs[i]));
+    std::vector<void*> batch_ptrs(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      GPU_RT_CHECK(gpuIpcOpenMemHandle(&batch_ptrs[i],
+                                       info_v[start + i].handle,
+                                       gpuIpcMemLazyEnablePeerAccess));
+    }
+
+    for (size_t i = 0; i < batch_size; ++i) {
+      void* src_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(batch_ptrs[i]) +
+          info_v[start + i].offset);
+      bool dst_is_gpu = (uccl::get_dev_idx(data_v[start + i]) >= 0);
+      auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+      gpuStream_t stream = streams[(start + i) % streams.size()];
+      GPU_RT_CHECK(gpuMemcpyAsync(data_v[start + i], src_ptr,
+                                   size_v[start + i], kind, stream));
+    }
+
+    size_t num_used = std::min(batch_size, streams.size());
+    for (size_t i = 0; i < num_used; ++i) {
+      GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+    }
+    for (auto& ptr : batch_ptrs) {
+      GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
+    }
   }
 
   return true;
@@ -1837,33 +1846,59 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
   pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  // Open all IPC handles
-  pending->raw_ptrs.resize(num_iovs);
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i], info_v[i].handle,
-                                     gpuIpcMemLazyEnablePeerAccess));
-  }
-
-  // Issue all async copies round-robin across streams
   std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
-  for (size_t i = 0; i < num_iovs; ++i) {
-    void* dst_ptr = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) + info_v[i].offset);
-    bool src_is_gpu =
-        (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
-    auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
-    gpuStream_t stream = streams[i % streams.size()];
-    GPU_RT_CHECK(
-        gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
-  }
 
-  // Record events on used streams
-  size_t num_used = std::min(num_iovs, streams.size());
-  pending->events.resize(num_used);
-  for (size_t i = 0; i < num_used; ++i) {
-    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
-                                         gpuEventDisableTiming));
-    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  // Process in batches to stay within CUDA IPC handle limit.
+  // Intermediate batches are sync'd and closed; the last batch stays open
+  // for async completion via the completion thread.
+  for (size_t start = 0; start < num_iovs; start += kMaxOpenIpcHandles) {
+    size_t end = std::min(start + kMaxOpenIpcHandles, num_iovs);
+    size_t batch_size = end - start;
+    bool is_last_batch = (end == num_iovs);
+
+    // Open handles for this batch
+    std::vector<void*> batch_ptrs(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      GPU_RT_CHECK(gpuIpcOpenMemHandle(&batch_ptrs[i],
+                                       info_v[start + i].handle,
+                                       gpuIpcMemLazyEnablePeerAccess));
+    }
+
+    // Issue async copies round-robin across streams
+    for (size_t i = 0; i < batch_size; ++i) {
+      void* dst_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(batch_ptrs[i]) +
+          info_v[start + i].offset);
+      bool src_is_gpu =
+          (uccl::get_dev_idx(const_cast<void*>(data_v[start + i])) >= 0);
+      auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+      gpuStream_t stream = streams[(start + i) % streams.size()];
+      GPU_RT_CHECK(gpuMemcpyAsync(dst_ptr, data_v[start + i],
+                                   size_v[start + i], kind, stream));
+    }
+
+    if (is_last_batch) {
+      // Keep handles open — completion thread will close them
+      pending->raw_ptrs = std::move(batch_ptrs);
+
+      // Record events on used streams
+      size_t num_used = std::min(num_iovs, streams.size());
+      pending->events.resize(num_used);
+      for (size_t i = 0; i < num_used; ++i) {
+        GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                             gpuEventDisableTiming));
+        GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+      }
+    } else {
+      // Sync and close intermediate batch
+      size_t num_used = std::min(batch_size, streams.size());
+      for (size_t i = 0; i < num_used; ++i) {
+        GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+      }
+      for (auto& ptr : batch_ptrs) {
+        GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
+      }
+    }
   }
 
   GPU_RT_CHECK(gpuSetDevice(orig_device));
@@ -1892,32 +1927,53 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
   pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  // Open all IPC handles
-  pending->raw_ptrs.resize(num_iovs);
-  for (size_t i = 0; i < num_iovs; ++i) {
-    GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i], info_v[i].handle,
-                                     gpuIpcMemLazyEnablePeerAccess));
-  }
-
-  // Issue all async copies round-robin across streams
   std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
-  for (size_t i = 0; i < num_iovs; ++i) {
-    void* src_ptr = reinterpret_cast<void*>(
-        reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) + info_v[i].offset);
-    bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
-    auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
-    gpuStream_t stream = streams[i % streams.size()];
-    GPU_RT_CHECK(
-        gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
-  }
 
-  // Record events on used streams
-  size_t num_used = std::min(num_iovs, streams.size());
-  pending->events.resize(num_used);
-  for (size_t i = 0; i < num_used; ++i) {
-    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
-                                         gpuEventDisableTiming));
-    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  // Process in batches to stay within CUDA IPC handle limit.
+  for (size_t start = 0; start < num_iovs; start += kMaxOpenIpcHandles) {
+    size_t end = std::min(start + kMaxOpenIpcHandles, num_iovs);
+    size_t batch_size = end - start;
+    bool is_last_batch = (end == num_iovs);
+
+    // Open handles for this batch
+    std::vector<void*> batch_ptrs(batch_size);
+    for (size_t i = 0; i < batch_size; ++i) {
+      GPU_RT_CHECK(gpuIpcOpenMemHandle(&batch_ptrs[i],
+                                       info_v[start + i].handle,
+                                       gpuIpcMemLazyEnablePeerAccess));
+    }
+
+    // Issue async copies round-robin across streams
+    for (size_t i = 0; i < batch_size; ++i) {
+      void* src_ptr = reinterpret_cast<void*>(
+          reinterpret_cast<uintptr_t>(batch_ptrs[i]) +
+          info_v[start + i].offset);
+      bool dst_is_gpu = (uccl::get_dev_idx(data_v[start + i]) >= 0);
+      auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+      gpuStream_t stream = streams[(start + i) % streams.size()];
+      GPU_RT_CHECK(gpuMemcpyAsync(data_v[start + i], src_ptr,
+                                   size_v[start + i], kind, stream));
+    }
+
+    if (is_last_batch) {
+      pending->raw_ptrs = std::move(batch_ptrs);
+
+      size_t num_used = std::min(num_iovs, streams.size());
+      pending->events.resize(num_used);
+      for (size_t i = 0; i < num_used; ++i) {
+        GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                             gpuEventDisableTiming));
+        GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+      }
+    } else {
+      size_t num_used = std::min(batch_size, streams.size());
+      for (size_t i = 0; i < num_used; ++i) {
+        GPU_RT_CHECK(gpuStreamSynchronize(streams[i]));
+      }
+      for (auto& ptr : batch_ptrs) {
+        GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
+      }
+    }
   }
 
   GPU_RT_CHECK(gpuSetDevice(orig_device));
