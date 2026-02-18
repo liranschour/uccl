@@ -1879,6 +1879,13 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
           (uccl::get_dev_idx(const_cast<void*>(data_v[start + i])) >= 0);
       auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
       gpuStream_t stream = streams[(start + i) % streams.size()];
+      std::cerr << "[writev_ipc_async] i=" << (start + i)
+                << " dst=" << dst_ptr
+                << " src=" << data_v[start + i]
+                << " size=" << size_v[start + i]
+                << " kind=" << (src_is_gpu ? "D2D" : "H2D")
+                << " base=" << batch_ptrs[i]
+                << " offset=" << info_v[start + i].offset << std::endl;
       GPU_RT_CHECK(gpuMemcpyAsync(dst_ptr, data_v[start + i],
                                    size_v[start + i], kind, stream));
     }
