@@ -1603,22 +1603,56 @@ bool Endpoint::read_ipc(uint64_t conn_id, void* data, size_t size,
 bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
                                IpcTransferInfo const& info,
                                uint64_t* transfer_id) {
-  // Create an IPC task for IPC write operation
-  auto task_ptr = create_ipc_task(conn_id, 0, TaskType::WRITE_IPC,
-                                  const_cast<void*>(data), size, info);
-  if (unlikely(task_ptr == nullptr)) {
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
     return false;
   }
 
-  auto* status = new TransferStatus();
-  status->task_ptr = task_ptr;
-  task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  auto* pending = new PendingIpcBatch();
+  pending->status = new TransferStatus();
+  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  UnifiedTask* task_raw = task_ptr.get();
+  // Open IPC handle
+  void* raw_dst_ptr = nullptr;
+  GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_dst_ptr, info.handle,
+                                   gpuIpcMemLazyEnablePeerAccess));
+  pending->raw_ptrs.push_back(raw_dst_ptr);
 
-  // Enqueue the task for processing by proxy thread
-  while (jring_mp_enqueue_bulk(send_unified_task_ring_, &task_raw, 1,
+  void* dst_ptr = reinterpret_cast<void*>(
+      reinterpret_cast<uintptr_t>(raw_dst_ptr) + info.offset);
+
+  bool src_is_gpu = (uccl::get_dev_idx(const_cast<void*>(data)) >= 0);
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  int num_streams =
+      std::min(streams.size(),
+               size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
+  if (!src_is_gpu) num_streams = 1;
+
+  size_t chunk_size = size / num_streams;
+  for (int i = 0; i < num_streams; ++i) {
+    void* chunk_data = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(data) + i * chunk_size);
+    void* chunk_dst = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(dst_ptr) + i * chunk_size);
+    auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
+    auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(chunk_dst, chunk_data, copy_size, kind, streams[i]));
+  }
+
+  // Record events on used streams
+  pending->events.resize(num_streams);
+  for (int i = 0; i < num_streams; ++i) {
+    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                         gpuEventDisableTiming));
+    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  }
+
+  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+  *transfer_id = reinterpret_cast<uint64_t>(pending->status);
+  while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
                                nullptr) != 1) {
   }
 
@@ -1628,22 +1662,56 @@ bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
 bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
                               IpcTransferInfo const& info,
                               uint64_t* transfer_id) {
-  // Create an IPC task for IPC read operation
-  auto task_ptr =
-      create_ipc_task(conn_id, 0, TaskType::READ_IPC, data, size, info);
-  if (unlikely(task_ptr == nullptr)) {
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
     return false;
   }
 
-  auto* status = new TransferStatus();
-  status->task_ptr = task_ptr;
-  task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  auto* pending = new PendingIpcBatch();
+  pending->status = new TransferStatus();
+  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  UnifiedTask* task_raw = task_ptr.get();
+  // Open IPC handle
+  void* raw_src_ptr = nullptr;
+  GPU_RT_CHECK(gpuIpcOpenMemHandle(&raw_src_ptr, info.handle,
+                                   gpuIpcMemLazyEnablePeerAccess));
+  pending->raw_ptrs.push_back(raw_src_ptr);
 
-  // Enqueue the task for processing by proxy thread
-  while (jring_mp_enqueue_bulk(recv_unified_task_ring_, &task_raw, 1,
+  void* src_ptr = reinterpret_cast<void*>(
+      reinterpret_cast<uintptr_t>(raw_src_ptr) + info.offset);
+
+  bool dst_is_gpu = (uccl::get_dev_idx(data) >= 0);
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  int num_streams =
+      std::min(streams.size(),
+               size < kIpcSizePerEngine ? 1 : (size_t)size / kIpcSizePerEngine);
+  if (!dst_is_gpu) num_streams = 1;
+
+  size_t chunk_size = size / num_streams;
+  for (int i = 0; i < num_streams; ++i) {
+    void* chunk_src = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(src_ptr) + i * chunk_size);
+    void* chunk_data = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(data) + i * chunk_size);
+    auto copy_size = i == num_streams - 1 ? size - i * chunk_size : chunk_size;
+    auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(chunk_data, chunk_src, copy_size, kind, streams[i]));
+  }
+
+  // Record events on used streams
+  pending->events.resize(num_streams);
+  for (int i = 0; i < num_streams; ++i) {
+    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                         gpuEventDisableTiming));
+    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  }
+
+  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+  *transfer_id = reinterpret_cast<uint64_t>(pending->status);
+  while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
                                nullptr) != 1) {
   }
 
@@ -1753,26 +1821,49 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
                                 std::vector<size_t> size_v,
                                 std::vector<IpcTransferInfo> info_v,
                                 size_t num_iovs, uint64_t* transfer_id) {
-  auto const_data_ptr =
-      std::make_shared<std::vector<void const*>>(std::move(data_v));
-  auto size_ptr = std::make_shared<std::vector<size_t>>(std::move(size_v));
-  auto ipc_info_ptr =
-      std::make_shared<std::vector<IpcTransferInfo>>(std::move(info_v));
-
-  auto task_ptr = create_writev_ipc_task(conn_id, std::move(const_data_ptr),
-                                         std::move(size_ptr),
-                                         std::move(ipc_info_ptr));
-  if (unlikely(task_ptr == nullptr)) {
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
     return false;
   }
 
-  auto* status = new TransferStatus();
-  status->task_ptr = task_ptr;
-  task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  auto* pending = new PendingIpcBatch();
+  pending->status = new TransferStatus();
+  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  UnifiedTask* task_raw = task_ptr.get();
-  while (jring_mp_enqueue_bulk(send_unified_task_ring_, &task_raw, 1,
+  // Open all IPC handles
+  pending->raw_ptrs.resize(num_iovs);
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i], info_v[i].handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+  }
+
+  // Issue all async copies round-robin across streams
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  for (size_t i = 0; i < num_iovs; ++i) {
+    void* dst_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) + info_v[i].offset);
+    bool src_is_gpu =
+        (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
+    auto kind = src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
+    gpuStream_t stream = streams[i % streams.size()];
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
+  }
+
+  // Record events on used streams
+  size_t num_used = std::min(num_iovs, streams.size());
+  pending->events.resize(num_used);
+  for (size_t i = 0; i < num_used; ++i) {
+    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                         gpuEventDisableTiming));
+    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  }
+
+  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+  *transfer_id = reinterpret_cast<uint64_t>(pending->status);
+  while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
                                nullptr) != 1) {
   }
 
@@ -1783,25 +1874,48 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
                                std::vector<size_t> size_v,
                                std::vector<IpcTransferInfo> info_v,
                                size_t num_iovs, uint64_t* transfer_id) {
-  auto data_ptr = std::make_shared<std::vector<void*>>(std::move(data_v));
-  auto size_ptr = std::make_shared<std::vector<size_t>>(std::move(size_v));
-  auto ipc_info_ptr =
-      std::make_shared<std::vector<IpcTransferInfo>>(std::move(info_v));
-
-  auto task_ptr = create_readv_ipc_task(conn_id, std::move(data_ptr),
-                                        std::move(size_ptr),
-                                        std::move(ipc_info_ptr));
-  if (unlikely(task_ptr == nullptr)) {
+  Conn* conn = get_conn(conn_id);
+  if (unlikely(conn == nullptr)) {
     return false;
   }
 
-  auto* status = new TransferStatus();
-  status->task_ptr = task_ptr;
-  task_ptr->status_ptr = status;
-  *transfer_id = reinterpret_cast<uint64_t>(status);
+  auto* pending = new PendingIpcBatch();
+  pending->status = new TransferStatus();
+  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
-  UnifiedTask* task_raw = task_ptr.get();
-  while (jring_mp_enqueue_bulk(recv_unified_task_ring_, &task_raw, 1,
+  // Open all IPC handles
+  pending->raw_ptrs.resize(num_iovs);
+  for (size_t i = 0; i < num_iovs; ++i) {
+    GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i], info_v[i].handle,
+                                     gpuIpcMemLazyEnablePeerAccess));
+  }
+
+  // Issue all async copies round-robin across streams
+  std::vector<gpuStream_t>& streams = ipc_streams_[conn->remote_gpu_idx_];
+  for (size_t i = 0; i < num_iovs; ++i) {
+    void* src_ptr = reinterpret_cast<void*>(
+        reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) + info_v[i].offset);
+    bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
+    auto kind = dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
+    gpuStream_t stream = streams[i % streams.size()];
+    GPU_RT_CHECK(
+        gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
+  }
+
+  // Record events on used streams
+  size_t num_used = std::min(num_iovs, streams.size());
+  pending->events.resize(num_used);
+  for (size_t i = 0; i < num_used; ++i) {
+    GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
+                                         gpuEventDisableTiming));
+    GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
+  }
+
+  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+
+  *transfer_id = reinterpret_cast<uint64_t>(pending->status);
+  while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
                                nullptr) != 1) {
   }
 
@@ -1971,12 +2085,11 @@ void Endpoint::ipc_completion_thread_func() {
         for (auto& ptr : (*it)->raw_ptrs) {
           GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
         }
-        // Store status_ptr before resetting task_ptr to avoid use-after-free
-        TransferStatus* status = (*it)->task->status_ptr;
+        TransferStatus* status = (*it)->status;
         delete *it;
         it = active.erase(it);
-        // Reset task_ptr after deleting PendingIpcBatch to ensure task pointer is valid
-        status->task_ptr.reset();
+        // Mark done AFTER cleanup; done.store must be last since
+        // poll_async deletes the TransferStatus when it sees done==true.
         status->done.store(true, std::memory_order_release);
       } else {
         ++it;
@@ -2008,70 +2121,6 @@ void Endpoint::send_proxy_thread_func() {
           write(task->conn_id, task->mr_id, task->data, task->size,
                 task->slot_item());
           break;
-        case TaskType::WRITE_IPC:
-          write_ipc(task->conn_id, task->data, task->size, task->ipc_info());
-          break;
-        case TaskType::WRITEV_IPC: {
-          // Launch async: open handles, issue copies, record events
-          TaskBatch const& batch = task->task_batch();
-          size_t num_iovs = batch.num_iovs;
-          void const** data_v = batch.const_data_v();
-          size_t* size_v = batch.size_v();
-          IpcTransferInfo* info_v = batch.ipc_info_v();
-
-          Conn* conn = get_conn(task->conn_id);
-          if (unlikely(conn == nullptr)) {
-            task->status_ptr->done.store(true, std::memory_order_release);
-            task->status_ptr->task_ptr.reset();
-            break;
-          }
-
-          auto* pending = new PendingIpcBatch();
-          pending->task = task;
-          GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
-          GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
-
-          // Open all IPC handles
-          pending->raw_ptrs.resize(num_iovs);
-          for (size_t i = 0; i < num_iovs; ++i) {
-            GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i],
-                                             info_v[i].handle,
-                                             gpuIpcMemLazyEnablePeerAccess));
-          }
-
-          // Issue all async copies round-robin across streams
-          std::vector<gpuStream_t>& streams =
-              ipc_streams_[conn->remote_gpu_idx_];
-          for (size_t i = 0; i < num_iovs; ++i) {
-            void* dst_ptr = reinterpret_cast<void*>(
-                reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) +
-                info_v[i].offset);
-            bool src_is_gpu =
-                (uccl::get_dev_idx(const_cast<void*>(data_v[i])) >= 0);
-            auto kind =
-                src_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyHostToDevice;
-            gpuStream_t stream = streams[i % streams.size()];
-            GPU_RT_CHECK(
-                gpuMemcpyAsync(dst_ptr, data_v[i], size_v[i], kind, stream));
-          }
-
-          // Record events on used streams
-          size_t num_used = std::min(num_iovs, streams.size());
-          pending->events.resize(num_used);
-          for (size_t i = 0; i < num_used; ++i) {
-            GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
-                                                 gpuEventDisableTiming));
-            GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
-          }
-
-          GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
-
-          // Hand off to completion thread via lock-free ring
-          while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
-                                       nullptr) != 1) {
-          }
-          break;
-        }
         case TaskType::SEND_NET:
           send(task->conn_id, task->mr_id, task->data, task->size);
           break;
@@ -2107,11 +2156,8 @@ void Endpoint::send_proxy_thread_func() {
                      << static_cast<int>(task->type);
           break;
       }
-      // Mark done immediately for non-IPC-batch tasks
-      if (task->type != TaskType::WRITEV_IPC) {
-        task->status_ptr->done.store(true, std::memory_order_release);
-        task->status_ptr->task_ptr.reset();
-      }
+      task->status_ptr->task_ptr.reset();
+      task->status_ptr->done.store(true, std::memory_order_release);
     }
   }
 }
@@ -2135,69 +2181,6 @@ void Endpoint::recv_proxy_thread_func() {
           read(task->conn_id, task->mr_id, task->data, task->size,
                task->slot_item());
           break;
-        case TaskType::READ_IPC:
-          read_ipc(task->conn_id, task->data, task->size, task->ipc_info());
-          break;
-        case TaskType::READV_IPC: {
-          // Launch async: open handles, issue copies, record events
-          TaskBatch const& batch = task->task_batch();
-          size_t num_iovs = batch.num_iovs;
-          void** data_v = batch.data_v();
-          size_t* size_v = batch.size_v();
-          IpcTransferInfo* info_v = batch.ipc_info_v();
-
-          Conn* conn = get_conn(task->conn_id);
-          if (unlikely(conn == nullptr)) {
-            task->status_ptr->done.store(true, std::memory_order_release);
-            task->status_ptr->task_ptr.reset();
-            break;
-          }
-
-          auto* pending = new PendingIpcBatch();
-          pending->task = task;
-          GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
-          GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
-
-          // Open all IPC handles
-          pending->raw_ptrs.resize(num_iovs);
-          for (size_t i = 0; i < num_iovs; ++i) {
-            GPU_RT_CHECK(gpuIpcOpenMemHandle(&pending->raw_ptrs[i],
-                                             info_v[i].handle,
-                                             gpuIpcMemLazyEnablePeerAccess));
-          }
-
-          // Issue all async copies round-robin across streams
-          std::vector<gpuStream_t>& streams =
-              ipc_streams_[conn->remote_gpu_idx_];
-          for (size_t i = 0; i < num_iovs; ++i) {
-            void* src_ptr = reinterpret_cast<void*>(
-                reinterpret_cast<uintptr_t>(pending->raw_ptrs[i]) +
-                info_v[i].offset);
-            bool dst_is_gpu = (uccl::get_dev_idx(data_v[i]) >= 0);
-            auto kind =
-                dst_is_gpu ? gpuMemcpyDeviceToDevice : gpuMemcpyDeviceToHost;
-            gpuStream_t stream = streams[i % streams.size()];
-            GPU_RT_CHECK(
-                gpuMemcpyAsync(data_v[i], src_ptr, size_v[i], kind, stream));
-          }
-
-          // Record events on used streams
-          size_t num_used = std::min(num_iovs, streams.size());
-          pending->events.resize(num_used);
-          for (size_t i = 0; i < num_used; ++i) {
-            GPU_RT_CHECK(gpuEventCreateWithFlags(&pending->events[i],
-                                                 gpuEventDisableTiming));
-            GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
-          }
-
-          GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
-
-          // Hand off to completion thread via lock-free ring
-          while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
-                                       nullptr) != 1) {
-          }
-          break;
-        }
         case TaskType::RECV_NET:
           recv(task->conn_id, task->mr_id, task->data, task->size);
           break;
@@ -2228,20 +2211,13 @@ void Endpoint::recv_proxy_thread_func() {
                 batch.num_iovs);
           break;
         }
-        case TaskType::SEND_NET:
-        case TaskType::SEND_IPC:
-        case TaskType::WRITE_NET:
-        case TaskType::WRITE_IPC:
         default:
           LOG(ERROR) << "Unexpected task type in receive processing: "
                      << static_cast<int>(task->type);
           break;
       }
-      // Mark done immediately for non-IPC-batch tasks
-      if (task->type != TaskType::READV_IPC) {
-        task->status_ptr->done.store(true, std::memory_order_release);
-        task->status_ptr->task_ptr.reset();
-      }
+      task->status_ptr->task_ptr.reset();
+      task->status_ptr->done.store(true, std::memory_order_release);
     }
   }
 }

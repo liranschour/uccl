@@ -403,14 +403,10 @@ class Endpoint {
     RECV_IPC,
     WRITE_NET,
     READ_NET,
-    WRITE_IPC,
-    READ_IPC,
     SENDV,
     RECVV,
     WRITEV,
     READV,
-    WRITEV_IPC,
-    READV_IPC,
   };
   struct TaskBatch {
     size_t num_iovs;  // Number of IO vectors
@@ -419,8 +415,6 @@ class Endpoint {
     std::shared_ptr<std::vector<size_t>> size_ptr;
     std::shared_ptr<std::vector<uint64_t>> mr_id_ptr;
     std::shared_ptr<std::vector<FifoItem>> slot_item_ptr;  // for READV/WRITEV
-    std::shared_ptr<std::vector<IpcTransferInfo>>
-        ipc_info_ptr;  // for WRITEV_IPC/READV_IPC
 
     TaskBatch() : num_iovs(0) {}
 
@@ -430,8 +424,7 @@ class Endpoint {
           data_ptr(std::move(other.data_ptr)),
           size_ptr(std::move(other.size_ptr)),
           mr_id_ptr(std::move(other.mr_id_ptr)),
-          slot_item_ptr(std::move(other.slot_item_ptr)),
-          ipc_info_ptr(std::move(other.ipc_info_ptr)) {}
+          slot_item_ptr(std::move(other.slot_item_ptr)) {}
 
     TaskBatch& operator=(TaskBatch&& other) noexcept {
       if (this != &other) {
@@ -441,7 +434,6 @@ class Endpoint {
         size_ptr = std::move(other.size_ptr);
         mr_id_ptr = std::move(other.mr_id_ptr);
         slot_item_ptr = std::move(other.slot_item_ptr);
-        ipc_info_ptr = std::move(other.ipc_info_ptr);
       }
       return *this;
     }
@@ -468,10 +460,6 @@ class Endpoint {
     FifoItem* slot_item_v() const {
       if (!slot_item_ptr) return nullptr;
       return slot_item_ptr->data();
-    }
-    IpcTransferInfo* ipc_info_v() const {
-      if (!ipc_info_ptr) return nullptr;
-      return ipc_info_ptr->data();
     }
   };
 
@@ -577,8 +565,7 @@ class Endpoint {
 
     inline bool is_batch_task() const {
       return type == TaskType::SENDV || type == TaskType::RECVV ||
-             type == TaskType::WRITEV || type == TaskType::READV ||
-             type == TaskType::WRITEV_IPC || type == TaskType::READV_IPC;
+             type == TaskType::WRITEV || type == TaskType::READV;
     }
   };
 
@@ -706,47 +693,6 @@ class Endpoint {
     return create_batch_task(conn_id, TaskType::READV, std::move(batch));
   }
 
-  inline std::shared_ptr<UnifiedTask> create_writev_ipc_task(
-      uint64_t conn_id,
-      std::shared_ptr<std::vector<void const*>> const_data_ptr,
-      std::shared_ptr<std::vector<size_t>> size_ptr,
-      std::shared_ptr<std::vector<IpcTransferInfo>> ipc_info_ptr) {
-    if (!const_data_ptr || !size_ptr || !ipc_info_ptr ||
-        const_data_ptr->size() != size_ptr->size() ||
-        size_ptr->size() != ipc_info_ptr->size()) {
-      return nullptr;
-    }
-    size_t num_iovs = const_data_ptr->size();
-
-    TaskBatch batch;
-    batch.num_iovs = num_iovs;
-    batch.const_data_ptr = std::move(const_data_ptr);
-    batch.size_ptr = std::move(size_ptr);
-    batch.ipc_info_ptr = std::move(ipc_info_ptr);
-
-    return create_batch_task(conn_id, TaskType::WRITEV_IPC, std::move(batch));
-  }
-
-  inline std::shared_ptr<UnifiedTask> create_readv_ipc_task(
-      uint64_t conn_id, std::shared_ptr<std::vector<void*>> data_ptr,
-      std::shared_ptr<std::vector<size_t>> size_ptr,
-      std::shared_ptr<std::vector<IpcTransferInfo>> ipc_info_ptr) {
-    if (!data_ptr || !size_ptr || !ipc_info_ptr ||
-        data_ptr->size() != size_ptr->size() ||
-        size_ptr->size() != ipc_info_ptr->size()) {
-      return nullptr;
-    }
-    size_t num_iovs = data_ptr->size();
-
-    TaskBatch batch;
-    batch.num_iovs = num_iovs;
-    batch.data_ptr = std::move(data_ptr);
-    batch.size_ptr = std::move(size_ptr);
-    batch.ipc_info_ptr = std::move(ipc_info_ptr);
-
-    return create_batch_task(conn_id, TaskType::READV_IPC, std::move(batch));
-  }
-
   inline std::shared_ptr<UnifiedTask> create_net_task(
       uint64_t conn_id, uint64_t mr_id, TaskType type, void* data, size_t size,
       FifoItem const& slot_item) {
@@ -755,21 +701,13 @@ class Endpoint {
     return task;
   }
 
-  inline std::shared_ptr<UnifiedTask> create_ipc_task(
-      uint64_t conn_id, uint64_t mr_id, TaskType type, void* data, size_t size,
-      IpcTransferInfo const& ipc_info) {
-    auto task = create_task(conn_id, mr_id, type, data, size);
-    task->ipc_info() = ipc_info;
-    return task;
-  }
-
   // For both net and ipc send/recv tasks.
   jring_t* send_unified_task_ring_ = nullptr;
   jring_t* recv_unified_task_ring_ = nullptr;
 
-  // Pending IPC batch passed from proxy threads to completion thread.
+  // Pending IPC batch passed from caller to completion thread.
   struct PendingIpcBatch {
-    UnifiedTask* task;
+    TransferStatus* status;
     std::vector<void*> raw_ptrs;     // IPC handles to close on completion
     std::vector<gpuEvent_t> events;  // Events to poll
     int orig_device;
