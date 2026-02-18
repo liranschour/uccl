@@ -116,7 +116,7 @@ class Endpoint {
   static constexpr uint32_t kMaxVector = 8;
   static constexpr size_t kIpcAlignment = 1ul << 20;
   static constexpr size_t kIpcSizePerEngine = 1ul << 20;
-  static constexpr size_t kMaxOpenIpcHandles = 16;
+  static constexpr size_t kMaxOpenIpcHandles = 8;
 
  public:
   // Prepare transfer info structure for receiving IPC handle

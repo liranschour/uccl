@@ -1851,10 +1851,16 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
   // Process in batches to stay within CUDA IPC handle limit.
   // Intermediate batches are sync'd and closed; the last batch stays open
   // for async completion via the completion thread.
+  std::cerr << "[writev_ipc_async] num_iovs=" << num_iovs
+            << " kMaxOpenIpcHandles=" << kMaxOpenIpcHandles << std::endl;
   for (size_t start = 0; start < num_iovs; start += kMaxOpenIpcHandles) {
     size_t end = std::min(start + kMaxOpenIpcHandles, num_iovs);
     size_t batch_size = end - start;
     bool is_last_batch = (end == num_iovs);
+
+    std::cerr << "[writev_ipc_async] batch start=" << start
+              << " batch_size=" << batch_size
+              << " is_last=" << is_last_batch << std::endl;
 
     // Open handles for this batch
     std::vector<void*> batch_ptrs(batch_size);
