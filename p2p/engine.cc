@@ -1610,7 +1610,9 @@ bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
 
   auto* pending = new PendingIpcBatch();
   pending->status = new TransferStatus();
-  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
   // Open IPC handle
@@ -1649,7 +1651,7 @@ bool Endpoint::write_ipc_async(uint64_t conn_id, void const* data, size_t size,
     GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
   }
 
-  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(orig_device));
 
   *transfer_id = reinterpret_cast<uint64_t>(pending->status);
   while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
@@ -1669,7 +1671,9 @@ bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
 
   auto* pending = new PendingIpcBatch();
   pending->status = new TransferStatus();
-  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
   // Open IPC handle
@@ -1708,7 +1712,7 @@ bool Endpoint::read_ipc_async(uint64_t conn_id, void* data, size_t size,
     GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
   }
 
-  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(orig_device));
 
   *transfer_id = reinterpret_cast<uint64_t>(pending->status);
   while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
@@ -1828,7 +1832,9 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
 
   auto* pending = new PendingIpcBatch();
   pending->status = new TransferStatus();
-  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
   // Open all IPC handles
@@ -1860,7 +1866,7 @@ bool Endpoint::writev_ipc_async(uint64_t conn_id,
     GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
   }
 
-  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(orig_device));
 
   *transfer_id = reinterpret_cast<uint64_t>(pending->status);
   while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
@@ -1881,7 +1887,9 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
 
   auto* pending = new PendingIpcBatch();
   pending->status = new TransferStatus();
-  GPU_RT_CHECK(gpuGetDevice(&pending->orig_device));
+  int orig_device;
+  GPU_RT_CHECK(gpuGetDevice(&orig_device));
+  pending->remote_device = conn->remote_gpu_idx_;
   GPU_RT_CHECK(gpuSetDevice(conn->remote_gpu_idx_));
 
   // Open all IPC handles
@@ -1912,7 +1920,7 @@ bool Endpoint::readv_ipc_async(uint64_t conn_id, std::vector<void*> data_v,
     GPU_RT_CHECK(gpuEventRecord(pending->events[i], streams[i]));
   }
 
-  GPU_RT_CHECK(gpuSetDevice(pending->orig_device));
+  GPU_RT_CHECK(gpuSetDevice(orig_device));
 
   *transfer_id = reinterpret_cast<uint64_t>(pending->status);
   while (jring_mp_enqueue_bulk(ipc_completion_ring_, &pending, 1,
@@ -2081,7 +2089,7 @@ void Endpoint::ipc_completion_thread_func() {
         for (auto& evt : (*it)->events) {
           GPU_RT_CHECK(gpuEventDestroy(evt));
         }
-        GPU_RT_CHECK(gpuSetDevice((*it)->orig_device));
+        GPU_RT_CHECK(gpuSetDevice((*it)->remote_device));
         for (auto& ptr : (*it)->raw_ptrs) {
           GPU_RT_CHECK(gpuIpcCloseMemHandle(ptr));
         }

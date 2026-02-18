@@ -710,7 +710,7 @@ class Endpoint {
     TransferStatus* status;
     std::vector<void*> raw_ptrs;     // IPC handles to close on completion
     std::vector<gpuEvent_t> events;  // Events to poll
-    int orig_device;
+    int remote_device;               // Device where handles were opened
   };
   jring_t* ipc_completion_ring_ = nullptr;  // MP/SC ring of PendingIpcBatch*
   std::thread ipc_completion_thread_;
