@@ -346,10 +346,100 @@ pass via RDMA, confirming the fallback works.
 
 ---
 
+### Phase 3 — Multi-process intra-node unit test
+
+**Goal:** verify that the CUDA IPC path (`writev_ipc_async`) works correctly for the
+production case: **two separate OS processes** on the same node (different PIDs).
+
+This is the complement to `test_nixl_intranode.py` (same process, direct `gpuMemcpy`
+bypass). The two tests together confirm both sub-cases of `is_intra_node`:
+
+| Test file | Processes | `is_same_process` | Path taken |
+|-----------|-----------|-------------------|------------|
+| `test_nixl_intranode.py` | 1 (both agents in-process) | `true` | direct `gpuMemcpy(fi.addr)` |
+| `test_nixl_intranode_multiproc.py` | 2 (spawned subprocesses) | `false` | `writev_ipc_async` CUDA IPC |
+
+#### Why two processes are needed
+
+`cudaIpcOpenMemHandle` is **forbidden** within the same OS process that called
+`cudaIpcGetMemHandle` on the same allocation. The same-process same-node case is
+therefore handled by a direct `gpuMemcpy` path (Phase 2 `is_same_process` bypass).
+The cross-process same-node case is the real CUDA IPC target; it requires separate
+PIDs and thus cannot be tested from a single Python interpreter.
+
+#### Same-process detection (`is_same_process`)
+
+Added to `uccl_engine.cc` alongside Phase 2. Works without any protocol change:
+
+1. `uccl_engine_get_metadata()` registers the engine's `(ip, port)` in a
+   process-global map (`s_local_listen_ports`) when it is first called.
+2. `uccl_engine_connect()` checks the registry: if `(remote_ip, remote_port)` is
+   already there, the remote endpoint is another engine **in this process** →
+   `conn->is_same_process = true`.
+3. `uccl_engine_write/read_vector`: when `is_intra_node && is_same_process`, use
+   `gpuMemcpy(fi.addr, ...)` directly — `fi.addr` is the peer's actual device pointer,
+   accessible in the same address space. Returns sentinel `transfer_id = 0`.
+4. `uccl_engine_xfer_status`: `transfer_id == 0` → return `true` immediately (already done).
+
+The nixl plugin (`uccl_backend.cpp`) requires **no changes** for this detection.
+The registry is populated before `uccl_engine_connect` is called because nixl always
+calls `get_agent_metadata()` before `add_remote_agent()`.
+
+#### Test design (`tests/test_nixl_intranode_multiproc.py`)
+
+Uses `multiprocessing.get_context("spawn")` so each subprocess starts a fresh Python
+interpreter (CUDA is not fork-safe). Metadata is exchanged via two
+`multiprocessing.Queue` objects (one per direction).
+
+**Deadlock-free exchange protocol:**
+```
+server_q (server → client):  ("meta", blob)  →  ("descs", bytes)
+client_q (client → server):  ("meta", blob)
+                              ("done", "")       ← after WRITE completes
+server_q (server → client):  ("pass", "")       ← after buffer verified
+                          or  ("fail", reason)
+```
+
+Server sends first (non-blocking queue puts, then blocks on client's meta).
+Client sends its own meta first, then receives server's data — no circular wait.
+
+**Why `get_serialized_descs` / `deserialize_descs` are needed:**
+In the single-process test the two agents share memory so descriptors can be passed
+as Python objects. Across processes the raw `(addr, len)` descriptor list must be
+serialised; nixl's `get_serialized_descs` + `deserialize_descs` API does this. The
+client passes the deserialized result as `remote_descs` to `initialize_xfer`.
+
+**Files changed:**
+- `uccl/p2p/uccl_engine.cc` — `is_same_process` field, `s_local_listen_ports` registry,
+  direct `gpuMemcpy` path in `write/read_vector`, sentinel in `xfer_status`,
+  `uccl_engine_set_same_process()` helper
+- `uccl/p2p/uccl_engine.h` — declaration of `uccl_engine_set_same_process`
+- `uccl/p2p/tests/test_nixl_intranode_multiproc.py` — new test (no C++ changes needed)
+
+**Running:**
+```bash
+export NIXL_PLUGIN_DIR=/path/to/nixl/build/src/plugins/uccl
+cd /home/lirans/uccl/p2p
+python tests/test_nixl_intranode_multiproc.py
+```
+
+Expected output (interleaved from both subprocesses):
+```
+=== UCCL intra-node IPC test (two OS processes) ===
+uccl_engine_connect: connection to <ip> is intra-node
+uccl_engine_accept:  connection from <ip> is intra-node
+[client] PASS: GPU-to-GPU WRITE via CUDA IPC completed
+[server] PASS: GPU buffer filled with ones
+=== test_nixl_intranode_multiproc PASSED ===
+```
+
+---
+
 ## Status
 
 | Phase | Status |
 |-------|--------|
 | Phase 1 — `uccl_conn::is_intra_node` in `uccl_engine.cc` | ✅ Done |
-| Phase 1 unit test — intra-node log check | 🔲 Next |
-| Phase 2 — `uccl_mem_token_t` + IPC dispatch in `uccl_engine` + nixl wiring | 🔲 Pending |
+| Phase 1 unit test — same-process intra-node (`test_nixl_intranode.py`) | ✅ Done |
+| Phase 2 — `uccl_mem_token_t` + IPC dispatch + same-process bypass | ✅ Done |
+| Phase 3 — multi-process unit test (`test_nixl_intranode_multiproc.py`) | ✅ Done |
