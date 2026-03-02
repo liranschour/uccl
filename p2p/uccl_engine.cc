@@ -26,7 +26,26 @@
 #include <string>
 #include <thread>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
+
+// Process-global registry of (ip, port) pairs belonging to uccl_engine instances
+// created in this process.  Populated by uccl_engine_get_metadata(); consulted
+// by uccl_engine_connect() to detect same-process connections without any
+// protocol changes.
+static std::unordered_map<std::string, std::unordered_set<int>> s_local_listen_ports;
+static std::mutex s_local_listen_ports_mutex;
+
+static void register_local_listen_addr(const std::string& ip, int port) {
+  std::lock_guard<std::mutex> lk(s_local_listen_ports_mutex);
+  s_local_listen_ports[ip].insert(port);
+}
+
+static bool is_local_engine_addr(const std::string& ip, int port) {
+  std::lock_guard<std::mutex> lk(s_local_listen_ports_mutex);
+  auto it = s_local_listen_ports.find(ip);
+  return it != s_local_listen_ports.end() && it->second.count(port) > 0;
+}
 
 #ifdef UCCL_P2P_USE_TCPX
 // nccl_tcpx_endpoint does not declare inside_python; define it here for
@@ -49,6 +68,8 @@ struct uccl_conn {
   std::string oob_conn_key;  // For epoll-based notifications
   std::thread* listener_thread;
   bool listener_running;
+  bool is_intra_node;        // true if peer is on the same physical node
+  bool is_same_process;      // true if peer is in the same OS process (IPC forbidden)
   std::mutex listener_mutex;
 };
 
@@ -127,10 +148,26 @@ void listener_thread_func(uccl_conn_t* conn) {
   }
 }
 
-uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python) {
+static std::string get_local_ip_from_engine(uccl_engine_t* engine) {
+  char* metadata = nullptr;
+  if (uccl_engine_get_metadata(engine, &metadata) != 0 || !metadata) return "";
+  std::string meta(metadata);
+  delete[] metadata;
+  size_t colon = meta.find(':');
+  if (colon == std::string::npos) return "";
+  return meta.substr(0, colon);
+}
+
+static bool uccl_conn_is_intra_node(uccl_conn_t* conn) {
+  return conn && conn->is_intra_node;
+}
+
+uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python,
+                                   int local_gpu_idx) {
   inside_python = in_python;
   uccl_engine_t* eng = new uccl_engine;
-  eng->endpoint = std::unique_ptr<Endpoint>(new Endpoint(num_cpus));
+  eng->endpoint = std::unique_ptr<Endpoint>(
+      new Endpoint(static_cast<uint32_t>(local_gpu_idx), num_cpus));
   return eng;
 }
 
@@ -160,6 +197,14 @@ uccl_conn_t* uccl_engine_connect(uccl_engine_t* engine, char const* ip_addr,
   conn->engine = engine;
   conn->listener_thread = nullptr;
   conn->listener_running = false;
+  conn->is_intra_node = (std::string(ip_addr) == get_local_ip_from_engine(engine));
+  // Same-process: remote port belongs to another uccl_engine in this process.
+  // Detected via the process-global registry populated by uccl_engine_get_metadata.
+  conn->is_same_process = conn->is_intra_node &&
+                          is_local_engine_addr(std::string(ip_addr), remote_port);
+  std::cout << "uccl_engine_connect: connection to " << ip_addr << " is "
+            << (uccl_conn_is_intra_node(conn) ? "intra" : "inter") << "-node"
+            << (conn->is_same_process ? " (same-process)" : "") << "\n";
   return conn;
 }
 
@@ -185,6 +230,10 @@ uccl_conn_t* uccl_engine_accept(uccl_engine_t* engine, char* ip_addr_buf,
   conn->engine = engine;
   conn->listener_thread = nullptr;
   conn->listener_running = false;
+  conn->is_intra_node = (ip_addr == get_local_ip_from_engine(engine));
+  conn->is_same_process = false;  // may be updated by uccl_engine_set_same_process
+  std::cout << "uccl_engine_accept: connection from " << ip_addr << " is "
+            << (uccl_conn_is_intra_node(conn) ? "intra" : "inter") << "-node\n";
   return conn;
 }
 
@@ -216,10 +265,46 @@ int uccl_engine_read(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
 int uccl_engine_read_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                             std::vector<void*> dst_v,
                             std::vector<size_t> size_v,
-                            std::vector<FifoItem> fifo_items, int num_iovs,
+                            std::vector<uccl_mem_token_t> tokens, int num_iovs,
                             uint64_t* transfer_id) {
   if (!conn || num_iovs <= 0) return -1;
 
+#if !defined(UCCL_P2P_USE_TCPX) && !defined(UCCL_P2P_USE_NCCL)
+  // Same-process: cudaIpcOpenMemHandle is forbidden; fi.addr is a valid device
+  // pointer accessible directly from this process.
+  if (conn->is_intra_node && conn->is_same_process) {
+    for (int i = 0; i < num_iovs; i++) {
+      FifoItem fi;
+      deserialize_fifo_item(tokens[i].fifo_buf, &fi);
+      void* src = reinterpret_cast<void*>(fi.addr);
+      GPU_RT_CHECK(gpuMemcpy(dst_v[i], src, size_v[i], gpuMemcpyDeviceToDevice));
+    }
+    *transfer_id = 0;  // sentinel: already done
+    return 0;
+  }
+  if (conn->is_intra_node && !tokens.empty() && tokens[0].has_ipc) {
+    std::vector<IpcTransferInfo> ipc_infos;
+    ipc_infos.reserve(num_iovs);
+    for (int i = 0; i < num_iovs; i++) {
+      IpcTransferInfo info;
+      memcpy(&info, tokens[i].ipc_buf, sizeof(IpcTransferInfo));
+      ipc_infos.push_back(info);
+    }
+    return conn->engine->endpoint->readv_ipc_async(conn->conn_id, dst_v,
+                                                   size_v, ipc_infos, num_iovs,
+                                                   transfer_id)
+               ? 0
+               : -1;
+  }
+#endif
+
+  std::vector<FifoItem> fifo_items;
+  fifo_items.reserve(num_iovs);
+  for (int i = 0; i < num_iovs; i++) {
+    FifoItem fi;
+    deserialize_fifo_item(tokens[i].fifo_buf, &fi);
+    fifo_items.push_back(fi);
+  }
   return conn->engine->endpoint->readv_async(conn->conn_id, mr_ids, dst_v,
                                              size_v, fifo_items, num_iovs,
                                              transfer_id)
@@ -263,13 +348,51 @@ int uccl_engine_write(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
 int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                              std::vector<void*> dst_v,
                              std::vector<size_t> size_v,
-                             std::vector<FifoItem> fifo_items, int num_iovs,
+                             std::vector<uccl_mem_token_t> tokens, int num_iovs,
                              uint64_t* transfer_id) {
   if (!conn || num_iovs <= 0) return -1;
 
 #ifdef UCCL_P2P_USE_TCPX
   return -1;  // TODO: support write_rc for TCPX
 #else
+
+#if !defined(UCCL_P2P_USE_NCCL)
+  // Same-process: cudaIpcOpenMemHandle is forbidden; fi.addr is a valid device
+  // pointer accessible directly from this process.
+  if (conn->is_intra_node && conn->is_same_process) {
+    for (int i = 0; i < num_iovs; i++) {
+      FifoItem fi;
+      deserialize_fifo_item(tokens[i].fifo_buf, &fi);
+      void* dst = reinterpret_cast<void*>(fi.addr);
+      GPU_RT_CHECK(gpuMemcpy(dst, dst_v[i], size_v[i], gpuMemcpyDeviceToDevice));
+    }
+    *transfer_id = 0;  // sentinel: already done
+    return 0;
+  }
+  if (conn->is_intra_node && !tokens.empty() && tokens[0].has_ipc) {
+    std::vector<IpcTransferInfo> ipc_infos;
+    ipc_infos.reserve(num_iovs);
+    for (int i = 0; i < num_iovs; i++) {
+      IpcTransferInfo info;
+      memcpy(&info, tokens[i].ipc_buf, sizeof(IpcTransferInfo));
+      ipc_infos.push_back(info);
+    }
+    std::vector<void const*> const_src_v(dst_v.begin(), dst_v.end());
+    return conn->engine->endpoint->writev_ipc_async(conn->conn_id, const_src_v,
+                                                    size_v, ipc_infos, num_iovs,
+                                                    transfer_id)
+               ? 0
+               : -1;
+  }
+#endif
+
+  std::vector<FifoItem> fifo_items;
+  fifo_items.reserve(num_iovs);
+  for (int i = 0; i < num_iovs; i++) {
+    FifoItem fi;
+    deserialize_fifo_item(tokens[i].fifo_buf, &fi);
+    fifo_items.push_back(fi);
+  }
   return conn->engine->endpoint->writev_async(conn->conn_id, mr_ids, dst_v,
                                               size_v, fifo_items, num_iovs,
                                               transfer_id)
@@ -279,6 +402,7 @@ int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
 }
 
 bool uccl_engine_xfer_status(uccl_conn_t* conn, uint64_t transfer_id) {
+  if (transfer_id == 0) return true;  // same-process direct memcpy: already done
   bool is_done;
   conn->engine->endpoint->poll_async(transfer_id, &is_done);
   return is_done;
@@ -355,20 +479,62 @@ void uccl_engine_mr_destroy(uccl_engine_t* engine, uccl_mr_t mr) {
   }
 }
 
-int uccl_engine_prepare_fifo(uccl_engine_t* engine, uccl_mr_t mr,
-                             void const* data, size_t size, char* fifo_buf) {
-  if (!engine || !data || !fifo_buf) return -1;
-
-  return engine->endpoint->prepare_fifo(mr, const_cast<void*>(data), size,
-                                        fifo_buf)
-             ? 0
-             : -1;
+void uccl_engine_set_same_process(uccl_conn_t* conn, bool val) {
+  if (conn) conn->is_same_process = val;
 }
 
-int uccl_engine_update_fifo(FifoItem& fifo_item, uint64_t remote_addr,
-                            uint32_t size) {
-  fifo_item.addr = remote_addr;
-  fifo_item.size = size;
+#if !defined(UCCL_P2P_USE_TCPX) && !defined(UCCL_P2P_USE_NCCL)
+static_assert(sizeof(IpcTransferInfo) == IPC_TOKEN_SIZE,
+              "IPC_TOKEN_SIZE in common.h does not match sizeof(IpcTransferInfo)");
+#endif
+
+int uccl_engine_prepare_token(uccl_engine_t* engine, uccl_mr_t mr,
+                              void const* data, size_t size, bool is_gpu,
+                              uccl_mem_token_t* out_token) {
+  if (!engine || !data || !out_token) return -1;
+
+  memset(out_token, 0, sizeof(uccl_mem_token_t));
+  out_token->base_addr = reinterpret_cast<uint64_t>(data);
+  out_token->has_ipc = false;
+
+  // RDMA token — always computed.
+  bool ok = engine->endpoint->prepare_fifo(mr, const_cast<void*>(data), size,
+                                           out_token->fifo_buf);
+  if (!ok) return -1;
+
+#if !defined(UCCL_P2P_USE_TCPX) && !defined(UCCL_P2P_USE_NCCL)
+  // IPC token — GPU memory only (conn_id arg is unused by advertise_ipc).
+  if (is_gpu) {
+    ok = engine->endpoint->advertise_ipc(0, const_cast<void*>(data), size,
+                                         out_token->ipc_buf);
+    out_token->has_ipc = ok;
+  }
+#endif
+
+  return 0;
+}
+
+int uccl_engine_update_token(uccl_mem_token_t* token, uint64_t sub_addr,
+                             uint32_t size) {
+  if (!token) return -1;
+
+  // RDMA: patch the absolute sub-buffer address and size into the FifoItem.
+  FifoItem fi;
+  deserialize_fifo_item(token->fifo_buf, &fi);
+  fi.addr = sub_addr;
+  fi.size = size;
+  serialize_fifo_item(fi, token->fifo_buf);
+
+#if !defined(UCCL_P2P_USE_TCPX) && !defined(UCCL_P2P_USE_NCCL)
+  // IPC: recompute the byte offset from the CUDA-aligned allocation base to
+  // sub_addr, and update the transfer size.
+  if (token->has_ipc) {
+    IpcTransferInfo* ipc = reinterpret_cast<IpcTransferInfo*>(token->ipc_buf);
+    uintptr_t aligned = token->base_addr & ~(static_cast<uintptr_t>(IPC_ALIGNMENT) - 1);
+    ipc->offset = sub_addr - aligned;
+    ipc->size = size;
+  }
+#endif
 
   return 0;
 }
@@ -465,6 +631,7 @@ int uccl_engine_get_metadata(uccl_engine_t* engine, char** metadata) {
 
       result = "" + ip_addr + ":" + std::to_string(port) + "?" +
                std::to_string(gpu_idx);
+      register_local_listen_addr(ip_addr, static_cast<int>(port));
     } else if (metadata_vec.size() == 22) {  // IPv6 format
       char ip6_str[INET6_ADDRSTRLEN];
       struct in6_addr ip6_addr;
@@ -477,6 +644,7 @@ int uccl_engine_get_metadata(uccl_engine_t* engine, char** metadata) {
 
       result = "" + std::string(ip6_str) + "]:" + std::to_string(port) + "?" +
                std::to_string(gpu_idx);
+      register_local_listen_addr(std::string(ip6_str), static_cast<int>(port));
     } else {  // Fallback: return hex representation
       result = "";
       for (size_t i = 0; i < metadata_vec.size(); ++i) {

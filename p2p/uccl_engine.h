@@ -6,7 +6,7 @@
 #include <stdint.h>
 
 #define MSG_SIZE 256
-#define FIFO_SIZE 64
+// FIFO_SIZE is defined in common.h
 // Handle for the UCCL engine instance
 typedef struct uccl_engine uccl_engine_t;
 
@@ -29,9 +29,11 @@ typedef struct md {
  * Create and initialize an engine instance.
  * @param num_cpus      The number of CPUs to use for the engine.
  * @param in_python     Whether the engine is being created in Python.
+ * @param local_gpu_idx Local GPU index to use for RDMA (default 0).
  * @return              Pointer to the engine instance, or NULL on failure.
  */
-uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python);
+uccl_engine_t* uccl_engine_create(int num_cpus, bool in_python,
+                                   int local_gpu_idx = 0);
 
 /**
  * Destroy the engine instance and free resources.
@@ -96,7 +98,8 @@ int uccl_engine_read(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
  * @param mr_ids        Vector of memory region handles.
  * @param dst_v         Vector of pointers to the data to receive.
  * @param size_v        Vector of sizes of the data to receive.
- * @param fifo_items    Vector of FifoItem structs for RDMA operations.
+ * @param tokens        Vector of uccl_mem_token_t structs (RDMA or IPC path
+ *                      selected automatically based on conn->is_intra_node).
  * @param num_iovs      Number of IO vectors.
  * @param transfer_id   Pointer to store the transfer ID.
  * @return              0 on success, non-zero on failure.
@@ -104,7 +107,7 @@ int uccl_engine_read(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
 int uccl_engine_read_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                             std::vector<void*> dst_v,
                             std::vector<size_t> size_v,
-                            std::vector<FifoItem> fifo_items, int num_iovs,
+                            std::vector<uccl_mem_token_t> tokens, int num_iovs,
                             uint64_t* transfer_id);
 /**
  * Send data (Non blocking).
@@ -150,7 +153,8 @@ int uccl_engine_write(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
  * @param mr_ids        Vector of memory region handles.
  * @param dst_v         Vector of pointers to the data to write.
  * @param size_v        Vector of sizes of the data to write.
- * @param fifo_items    Vector of FifoItem structs for RDMA operations.
+ * @param tokens        Vector of uccl_mem_token_t structs (RDMA or IPC path
+ *                      selected automatically based on conn->is_intra_node).
  * @param num_iovs      Number of IO vectors.
  * @param transfer_id   Pointer to store the transfer ID.
  * @return              0 on success, non-zero on failure.
@@ -158,7 +162,7 @@ int uccl_engine_write(uccl_conn_t* conn, uccl_mr_t mr, void const* data,
 int uccl_engine_write_vector(uccl_conn_t* conn, std::vector<uccl_mr_t> mr_ids,
                              std::vector<void*> dst_v,
                              std::vector<size_t> size_v,
-                             std::vector<FifoItem> fifo_items, int num_iovs,
+                             std::vector<uccl_mem_token_t> tokens, int num_iovs,
                              uint64_t* transfer_id);
 /**
  * Receive data (blocking).
@@ -191,6 +195,15 @@ void uccl_engine_conn_destroy(uccl_conn_t* conn);
 void uccl_engine_mr_destroy(uccl_engine_t* engine, uccl_mr_t mr);
 
 /**
+ * Mark a connection as same-process (CUDA IPC is forbidden; direct GPU
+ * memcpy will be used instead).  Call after uccl_engine_connect when
+ * the remote PID equals the local PID.
+ * @param conn          Connection handle.
+ * @param val           True to enable same-process mode.
+ */
+void uccl_engine_set_same_process(uccl_conn_t* conn, bool val);
+
+/**
  * Get endpoint metadata for connection establishment.
  * @param engine        The engine instance.
  * @param metadata      Pointer to store the metadata in string.
@@ -213,26 +226,29 @@ std::vector<notify_msg_t> uccl_engine_get_notifs();
 int uccl_engine_send_notif(uccl_conn_t* conn, notify_msg_t* notify_msg);
 
 /**
- * Prepare FIFO metadata for a memory region without requiring a connection.
- * This can be called at memory registration time to pre-compute the fifo_item
- * for true one-sided RDMA operations.
+ * Prepare a unified memory token for a registered buffer.
+ * Always computes the RDMA FifoItem; also computes the CUDA IPC handle when
+ * is_gpu is true.  Call at registerMem time — no connection is required.
  * @param engine        The engine instance.
- * @param mr            Memory region handle.
- * @param data          Pointer to the data buffer.
- * @param size          Size of the data.
- * @param fifo_buf      Output buffer to store the serialized FifoItem (64
- * bytes).
+ * @param mr            Memory region handle (from uccl_engine_reg).
+ * @param data          Pointer to the registered buffer.
+ * @param size          Size of the registered buffer.
+ * @param is_gpu        True if the buffer is VRAM (enables IPC token).
+ * @param out_token     Output token struct.
  * @return              0 on success, -1 on failure.
  */
-int uccl_engine_prepare_fifo(uccl_engine_t* engine, uccl_mr_t mr,
-                             void const* data, size_t size, char* fifo_buf);
+int uccl_engine_prepare_token(uccl_engine_t* engine, uccl_mr_t mr,
+                              void const* data, size_t size, bool is_gpu,
+                              uccl_mem_token_t* out_token);
 
 /**
- * Update the address and size in a FIFO item.
- * @param fifo_buf      Pointer to the FIFO item buffer (64 bytes).
- * @param remote_addr   New remote address to set.
- * @param size          New size to set.
+ * Patch a token for a specific sub-buffer transfer.
+ * Updates both the RDMA FifoItem address and (if has_ipc) the IPC offset.
+ * Call at prepXfer time on a per-request copy of the base token.
+ * @param token         Token to update in place.
+ * @param sub_addr      Absolute address of the sub-buffer on the remote side.
+ * @param size          Transfer size in bytes.
  * @return              0 on success, -1 on failure.
  */
-int uccl_engine_update_fifo(FifoItem& fifo_item, uint64_t remote_addr,
-                            uint32_t size);
+int uccl_engine_update_token(uccl_mem_token_t* token, uint64_t sub_addr,
+                             uint32_t size);
